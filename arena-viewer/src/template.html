@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Robot Wars — Permutation Arena</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0c12;
+    font-family: system-ui, -apple-system, sans-serif; color: #dfe6f5; }
+  #stage { position: absolute; inset: 0; }
+  #hud { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center;
+    gap: 14px; padding: 12px 18px; pointer-events: none;
+    background: linear-gradient(#0a0c12ee, #0a0c1200); }
+  #hud h1 { font-size: 17px; margin: 0 10px 0 0; letter-spacing: 2px; text-transform: uppercase;
+    color: #ffb63d; text-shadow: 0 0 14px #ff632466; white-space: nowrap; }
+  #hud select { pointer-events: auto; background: #171b26; color: #dfe6f5;
+    border: 1px solid #2c3345; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  #hud label { font-size: 12px; color: #8b93a8; display: flex; gap: 6px; align-items: center; }
+  #hud input[type=color] { pointer-events: auto; width: 34px; height: 26px; padding: 0;
+    border: 1px solid #2c3345; border-radius: 6px; background: #171b26; cursor: pointer; }
+  #hud button { pointer-events: auto; background: #171b26; color: #8b93a8; font-size: 12px;
+    border: 1px solid #2c3345; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  #hud button:hover { color: #dfe6f5; }
+  #swatches { pointer-events: auto; display: flex; gap: 4px; }
+  #swatches i { width: 16px; height: 16px; border-radius: 4px; cursor: pointer;
+    border: 1px solid #0006; display: inline-block; }
+  #loading { font-size: 12px; color: #8b93a8; margin-left: auto; }
+  #panel { position: absolute; top: 64px; right: -340px; width: 300px; max-height: calc(100% - 120px);
+    overflow-y: auto; background: #12151ecc; backdrop-filter: blur(8px);
+    border: 1px solid #2c3345; border-radius: 12px; padding: 16px 18px;
+    transition: right .25s ease; font-size: 13px; }
+  #panel.open { right: 16px; }
+  #panel h2 { margin: 0 0 10px; font-size: 16px; color: #ffb63d; text-transform: capitalize; }
+  #panel .notes div { margin: 3px 0; color: #aab3c8; }
+  #panel .notes b { color: #dfe6f5; font-weight: 600; }
+  #panel table { width: 100%; margin-top: 12px; border-collapse: collapse; }
+  #panel td { padding: 4px 2px; border-top: 1px solid #232838; }
+  #panel td:first-child { color: #8b93a8; }
+  #panel td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  #panel .hint { margin-top: 12px; font-size: 11px; color: #667; font-style: italic; }
+  #panel #fire-btn { margin-top: 14px; width: 100%; background: #2a1214; color: #ff6b5d;
+    border: 1px solid #7a2c24; border-radius: 8px; padding: 9px 0; font-size: 14px;
+    font-weight: 700; letter-spacing: 2px; cursor: pointer; }
+  #panel #fire-btn:hover { background: #3d1a17; color: #ff8a75; }
+  #hud input[type=checkbox] { pointer-events: auto; accent-color: #ffb63d; }
+  #help { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: #667089; pointer-events: none; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="hud">
+  <h1>Robot Wars &mdash; all 36 builds</h1>
+  <label>size <select id="f-size">
+    <option value="all">all</option><option>small</option><option>medium</option><option>large</option>
+  </select></label>
+  <label>gun <select id="f-gun">
+    <option value="all">all</option><option>laser</option><option>cannon</option><option>shotgun</option>
+  </select></label>
+  <label>engine <select id="f-engine">
+    <option value="all">all</option><option>standard</option><option>sprint</option><option>tank</option><option>hover</option>
+  </select></label>
+  <label><input type="checkbox" id="labels-toggle" checked> labels</label>
+  <label>colour <input type="color" id="tint" value="#3fd0c9"></label>
+  <span id="swatches"></span>
+  <button id="reset-tint">reset colours</button>
+  <span id="loading">loading robots…</span>
+</div>
+<div id="panel"></div>
+<div id="help">drag to orbit &nbsp;·&nbsp; scroll to zoom &nbsp;·&nbsp; click a robot for its spec sheet &nbsp;·&nbsp; colour tints the selected robot (or everyone) &nbsp;·&nbsp; space = FIRE</div>
+<script>/*__GLB_DATA__*/</script>
+<script>/*__BUNDLE__*/</script>
+</body>
+</html>

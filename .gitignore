@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+submissions/
+recordings/
+*.jsonl
+.DS_Store
+.omc/
+dist/
