@@ -1,6 +1,6 @@
 # Robot Wars: the AI build-off
 
-![The 3D broadcast arena](docs/arena-orbit.gif)
+![Robot Wars](docs/hero-arena.jpg)
 
 Design a combat robot in one Python file, build its brain with Claude Code (or by hand), then watch it fight in a 3D broadcast arena on the big screen. Pure Python standard library. No installs, no dependencies, fully offline.
 
