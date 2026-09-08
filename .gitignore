@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 submissions/
 recordings/
+events/
+tests/golden_corpus/manifest.json
 *.jsonl
 .DS_Store
 .omc/

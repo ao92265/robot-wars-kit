@@ -16,8 +16,12 @@ import gzip
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from assets_js import logo_js  # noqa: E402
+
 GAME = os.path.abspath(os.path.join(HERE, "..", ".."))
 # Blender-built assets (see robot-models/build_robots.py + build_arenas.py)
 MODELS_DEFAULT = os.path.join(GAME, "robot-models")
@@ -26,24 +30,6 @@ MODELS_DEFAULT = os.path.join(GAME, "robot-models")
 def read(p):
     with open(p, encoding="utf-8") as f:
         return f.read()
-
-
-def logo_js():
-    """Real Harris logos, inlined as data URIs so the offline page can draw them
-    on the jumbotrons + header without fetching anything. White SVG for dark UI
-    chrome; full-colour PNG for the arena billboards."""
-    out = ""
-    p = os.path.join(HERE, "src", "assets", "harris-logo-white.svg")
-    if os.path.exists(p):
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        out += 'window.__HARRIS_LOGO__ = "data:image/svg+xml;base64,' + b64 + '";\n'
-    p = os.path.join(HERE, "src", "assets", "harris-logo-color.png")
-    if os.path.exists(p):
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        out += 'window.__HARRIS_LOGO_COLOR__ = "data:image/png;base64,' + b64 + '";\n'
-    return out
 
 
 def _lean_filter(match_txt):
@@ -147,7 +133,11 @@ def main():
     if os.path.exists(voice_js):
         voice_tag = "<script>\n" + read(voice_js) + "\n</script>"
 
-    app_tag = "<script>\n" + logo_js() + app + "\n</script>"
+    # stamp the build so a stale cached page is visible on screen rather than
+    # inferred: this file is ~10MB and browsers hold onto it hard
+    build_id = time.strftime("%H:%M:%S")
+    app_tag = ("<script>\nwindow.__RW_BUILD__ = " + json.dumps(build_id) + ";\n"
+               + logo_js() + app + "\n</script>")
 
     html = (tpl.replace("<!--THREE-->", three_tag)
                .replace("<!--MATCH-->", match_tag)
@@ -158,7 +148,7 @@ def main():
         f.write(html)
 
     kb = len(html.encode("utf-8")) / 1024
-    print(f"wrote {args.out}  ({kb:.0f} KB, self-contained)")
+    print(f"wrote {args.out}  ({kb:.0f} KB, self-contained, build {build_id})")
     if not match_tag:
         print("  (no embedded match — open then Load a .jsonl)")
 

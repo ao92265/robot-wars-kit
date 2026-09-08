@@ -16,7 +16,6 @@ Inlines, in order, into the template placeholders:
 Writes tournament/visual/tournament.html.
 """
 import argparse
-import base64
 import json
 import os
 import sys
@@ -25,7 +24,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
 
+from assets_js import logo_js  # noqa: E402
 from engine import maps  # noqa: E402
 from tournament.bracket import run_bracket  # noqa: E402
 from tournament.ingest import ingest  # noqa: E402
@@ -69,6 +70,16 @@ def round_name(round_idx, total_rounds):
     from_final = total_rounds - round_idx        # 0 = final
     return {0: "Final", 1: "Semi-finals", 2: "Quarter-finals",
             3: "Round of 16", 4: "Round of 32"}.get(from_final, f"Round {round_idx}")
+
+
+def _json_for_script(payload):
+    """JSON safe to sit inside an inline <script>. `json.dumps` leaves `</script>`
+    intact, so a team name carrying one would close the block and everything after
+    it would be markup. Team names reach here through a filename, which `_slug`
+    has already reduced to alphanumerics — but the page must not depend on that.
+    (U+2028/U+2029 need no handling: json.dumps escapes them by default.)"""
+    return (json.dumps(payload)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
 
 
 def build_payload(summary, seed, map_kw, recordings_dir):
@@ -137,19 +148,26 @@ def main():
     arena_app = read(os.path.join(HERE, "src", "arena.app.js"))
     tourney_app = read(os.path.join(HERE, "src", "tournament.app.js"))
 
-    # real Harris logo (white SVG) as a data URI — drawn on jumbotrons + header offline
-    logo_js = ""
-    logo_p = os.path.join(HERE, "src", "assets", "harris-logo-white.svg")
-    if os.path.exists(logo_p):
-        with open(logo_p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        logo_js = 'window.__HARRIS_LOGO__ = "data:image/svg+xml;base64,' + b64 + '";\n'
+    # Brand art as data URIs: jumbotrons, header, and the ad boards,
+    # all drawn offline. This page used to inline only the white SVG, which left
+    # every ad board on it blank; assets_js keeps it in step with the
+    # arena page by construction.
+    brand_js = logo_js()
 
-    data_tag = "<script>window.__TOURNAMENT__ = " + json.dumps(payload) + ";</script>"
+    # same pre-baked announcer pack the arena page gets (build_arena.py) — this
+    # is the page the show is actually driven from, so without it the VOICE
+    # button falls all the way back to browser speech
+    voice_tag = ""
+    voice_js = os.path.join(HERE, "src", "voice_clips.js")
+    if os.path.exists(voice_js):
+        voice_tag = "<script>\n" + read(voice_js) + "\n</script>"
+
+    data_tag = "<script>window.__TOURNAMENT__ = " + _json_for_script(payload) + ";</script>"
     html = (tpl
             .replace("<!--THREE-->", "<script>\n" + three + "\n</script>")
             .replace("<!--TOURNAMENT_DATA-->", data_tag)
-            .replace("<!--ARENA_APP-->", "<script>\n" + logo_js + arena_app + "\n</script>")
+            .replace("<!--VOICE-->", voice_tag)
+            .replace("<!--ARENA_APP-->", "<script>\n" + brand_js + arena_app + "\n</script>")
             .replace("<!--TOURNAMENT_APP-->", "<script>\n" + tourney_app + "\n</script>"))
 
     with open(args.out, "w", encoding="utf-8") as f:

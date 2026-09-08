@@ -88,15 +88,36 @@ def arena_fx(mp3_bytes):
             return mp3_bytes
 
 
-def team_names_from_submissions(path):
-    """Best-effort team list from an ingest manifest or submission dir."""
+def roster_from_submissions(path):
+    """(team_names, bot_labels) from an ingest manifest. Grouping and the
+    "Team:Bot" label are taken from tournament.bracket so the baked keys can't
+    drift from what the engine actually emits into the frames."""
     man = os.path.join(path, "manifest.json")
-    if os.path.exists(man):
-        with open(man) as f:
-            m = json.load(f)
-        ents = m.get("entries", m if isinstance(m, list) else [])
-        names = [e.get("name") or e.get("team") for e in ents if isinstance(e, dict)]
-        return [n for n in names if n]
+    if not os.path.exists(man):
+        return [], []
+    with open(man) as f:
+        m = json.load(f)
+    accepted = m.get("accepted", m.get("entries", m if isinstance(m, list) else []))
+    from ..bracket import teams_from_accepted
+    teams = teams_from_accepted([e for e in accepted if isinstance(e, dict)])
+    labels = []
+    for t in teams:
+        for b in sorted(t["bots"], key=lambda b: str(b.get("bot", b["name"]))):
+            labels.append(f"{t['name']}:{b.get('bot', b['name'])}")
+    return [t["name"] for t in teams], labels
+
+
+def sample_labels():
+    """"Team:Bot" labels in the bundled demo reel. arena.html ships with that
+    match, so bake its bots too or the preview has no per-bot voice at all."""
+    path = os.path.join(ROOT, "tournament", "visual", "samples", "demo.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        for line in f:                       # first frame carries the full roster
+            robots = json.loads(line).get("robots")
+            if robots:
+                return [r["name"] for r in robots if r.get("name")]
     return []
 
 
@@ -106,6 +127,7 @@ def main():
     ap.add_argument("--teams", default="", help="comma-separated team names")
     ap.add_argument("--teams-from", default="", help="submissions dir to read names from")
     ap.add_argument("--fx", action="store_true", help="apply ffmpeg arena post")
+    ap.add_argument("--no-demo", action="store_true", help="skip the bundled demo-reel bots")
     ap.add_argument("--voice-id", default=os.environ.get("ELEVENLABS_VOICE_ID", L.DEFAULT_VOICE_ID))
     ap.add_argument("--model-id", default=os.environ.get("ELEVENLABS_MODEL_ID", L.DEFAULT_MODEL_ID))
     args = ap.parse_args()
@@ -113,16 +135,52 @@ def main():
     if args.list_voices:
         list_voices(); return
 
-    # assemble the line set: generic + per-team
+    # assemble the line set: generic + per-team + per-bot
     teams = [t.strip() for t in args.teams.split(",") if t.strip()]
+    labels = []
     if args.teams_from:
-        teams += team_names_from_submissions(args.teams_from)
+        t2, labels = roster_from_submissions(args.teams_from)
+        teams += t2
+    if not args.no_demo:
+        for lb in sample_labels():
+            if lb not in labels:
+                labels.append(lb)
+                t = lb.split(":", 1)[0]
+                if t not in teams:
+                    teams.append(t)
     script = dict(L.GENERIC)
     script.update(L.per_team_lines(teams))
+    script.update(L.per_bot_lines(labels))
+    script.update(L.entrance_lines(labels))
 
     os.makedirs(CLIPS_DIR, exist_ok=True)
-    clips = {}
+
+    # Incremental: an existing clip whose text AND voice/model/fx are unchanged
+    # is already correct on disk. Re-rendering it costs credits and changes
+    # nothing, so reuse the mp3 and only pay for genuinely new lines.
+    prev = {}
+    man_path = os.path.join(CLIPS_DIR, "manifest.json")
+    if os.path.exists(man_path):
+        with open(man_path) as f:
+            pm = json.load(f)
+        if (pm.get("voice_id") == args.voice_id and pm.get("model_id") == args.model_id
+                and bool(pm.get("fx")) == bool(args.fx)):
+            prev = pm.get("lines", {})
+
+    clips, by_text, reused = {}, {}, 0
     for i, (key, text) in enumerate(script.items(), 1):
+        cached = os.path.join(CLIPS_DIR, key + ".mp3")
+        if prev.get(key) == text and os.path.exists(cached):
+            with open(cached, "rb") as f:
+                audio = f.read()
+            clips[key] = "data:audio/mpeg;base64," + base64.b64encode(audio).decode()
+            by_text.setdefault(text, (key, clips[key]))
+            reused += 1
+            continue
+        if text in by_text:                     # same words, same audio — don't pay twice
+            print(f"[{i}/{len(script)}] {key}: reuse of {by_text[text][0]!r}")
+            clips[key] = by_text[text][1]
+            continue
         print(f"[{i}/{len(script)}] {key}: {text!r}")
         try:
             audio = tts(text, args.voice_id, args.model_id)
@@ -134,6 +192,7 @@ def main():
         with open(os.path.join(CLIPS_DIR, key + ".mp3"), "wb") as f:
             f.write(audio)
         clips[key] = "data:audio/mpeg;base64," + base64.b64encode(audio).decode()
+        by_text[text] = (key, clips[key])
 
     with open(OUT_JS, "w") as f:
         f.write("/* Auto-generated by tournament/voice/bake.py — do not edit. */\n")
@@ -143,7 +202,7 @@ def main():
         json.dump({"voice_id": args.voice_id, "model_id": args.model_id,
                    "fx": args.fx, "lines": script}, f, indent=2)
     kb = sum(len(v) for v in clips.values()) / 1024
-    print(f"\nbaked {len(clips)} clips -> {OUT_JS} ({kb:.0f} KB inlined)")
+    print(f"\nbaked {len(clips)} clips ({reused} reused from disk) -> {OUT_JS} ({kb:.0f} KB inlined)")
     print("now run: python3 tournament/visual/build_arena.py")
 
 

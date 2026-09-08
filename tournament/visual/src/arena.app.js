@@ -43,8 +43,20 @@ function wallsKey(w, h, walls) {
   return [w | 0, h | 0].concat((walls || []).map((r) => r.map(Math.round).join(",")).sort()).join(";");
 }
 // inflate a gzipped+base64 payload with the browser's native decompressor
-// (DecompressionStream: no library, works from file://, still fully offline)
+// (DecompressionStream: no library, works from file://, still fully offline).
+// Without it neither the embedded models nor the embedded match can load;
+// tell the operator instead of failing silently with no replay on screen.
+let gzipWarned = false;
+function warnNoGunzip() {
+  if (gzipWarned) return; gzipWarned = true;
+  const el = document.createElement("div");
+  el.textContent = "This browser can't decompress the embedded assets -- use a current Chrome, Edge, or Firefox.";
+  el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#a11;color:#fff;" +
+    "font:600 13px/1.6 sans-serif;text-align:center;padding:4px 0;";
+  document.body.appendChild(el);
+}
 async function gunzipB64(b64) {
+  if (typeof DecompressionStream === "undefined") { warnNoGunzip(); throw new Error("DecompressionStream unsupported"); }
   const ds = new DecompressionStream("gzip");
   const stream = new Blob([b64buf(b64)]).stream().pipeThrough(ds);
   return await new Response(stream).text();
@@ -93,48 +105,106 @@ function preloadModels(done) {
 const $ = (id) => document.getElementById(id);
 const stage = $("stage"), hud = $("hud"), banner = $("banner");
 const playBtn = $("play"), speed = $("speed");
+const DEBUG = /[?&]debug/.test(location.search);   // ?debug shows the tick chip
 
 // ----- match state ----------------------------------------------------------
-let frames = [], AW = 1280, AH = 768, names = {};
+let frames = [], AW = 1280, AH = 768, names = {}, voiceKey = {}, hpBand = {};
+let jumboFeedScreen = null;   // backdrop board mirroring the broadcast
+let jumboFeedFrame = null;    // its cyan housing, excluded from the feed pass
+
+// Every pickup kind the engine can emit (engine/game.py _collect_pickups) and
+// every hazard zone. Kept as tables so a new engine kind shows up as a missing
+// entry here rather than silently falling through with no ticker and no voice.
+const PICKUP_UI = {
+  overdrive: "⚡ OVERDRIVE claimed", shield: "🛡 SHIELD up", haste: "💨 HASTE grabbed",
+  rockets: "🚀 ROCKETS loaded", traps: "🕳 TRAPS armed", repair: "🔧 REPAIRS taken",
+};
+const HAZARD_UI = { lava: "🌋 INTO THE LAVA", pit: "🕳 INTO THE PIT", water: "💧 INTO THE WATER" };
+// HP band -> clip stem. 40 is deliberately colour commentary rather than a number.
+const BAND_CLIP = { 75: "hp75", 50: "hp50", 40: "trouble", 25: "hp25" };
+let hazardSaid = {};
 let simTime = 0;            // playback head, in ticks (float)
 let playing = false, fps = 18, lastT = 0, raf = null;
 let saidGo = false, saidWinner = false, lastTickSeen = -1, alivePrev = {};
+let fightHold = 0;          // brief playhead hold so FIGHT lands before the first exchange
 
 // ============================================================================
 // THREE scene
 // ============================================================================
 const renderer = new T.WebGLRenderer({ canvas: $("cv"), antialias: true });
+// Full retina. The 1.5 cap left visibly stair-stepped edges on the pit walls
+// and hazard rims — the MSAA in the bloom target can't recover detail the
+// drawing buffer never had.
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = T.PCFSoftShadowMap;
 renderer.outputColorSpace = T.SRGBColorSpace;
 renderer.toneMapping = T.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.12;        // broadcast: high clarity, not blown out
+renderer.toneMappingExposure = 0.95;        // broadcast: high clarity, not blown out
 
 // Broadcast Combat palette: a brightly-lit TV pit against a cool studio slate,
 // team-colored key spots, clean painted chassis. Not the molten foundry.
-const BG_COL = 0x171d29;
 const scene = new T.Scene();
-scene.background = new T.Color(BG_COL);
+// Gradient skydome instead of a flat void: deep navy at the floor line, a faint
+// warm horizon-glow band above the stands, near-black at the zenith. A giant
+// inverted sphere with a canvas gradient — PMREM-free, vendored Three only.
+(function () {
+  const c = document.createElement("canvas"); c.width = 4; c.height = 512;
+  const g = c.getContext("2d");
+  const grd = g.createLinearGradient(0, 512, 0, 0);
+  grd.addColorStop(0.0, "#141a26");
+  grd.addColorStop(0.24, "#1b2130");
+  grd.addColorStop(0.36, "#453629");   // warm horizon glow above the stands
+  grd.addColorStop(0.52, "#141826");
+  grd.addColorStop(1.0, "#0a0e18");
+  g.fillStyle = grd; g.fillRect(0, 0, 4, 512);
+  const tex = new T.CanvasTexture(c); tex.colorSpace = T.SRGBColorSpace;
+  const dome = new T.Mesh(new T.SphereGeometry(6000, 24, 18),
+    new T.MeshBasicMaterial({ map: tex, side: T.BackSide, depthWrite: false }));
+  dome.renderOrder = -1; dome.frustumCulled = false;
+  scene.add(dome);
+})();
 // No scene fog: the depth haze muddied the broadcast look on the big screen.
 
-const camera = new T.PerspectiveCamera(52, 16 / 9, 1, 8000);
+// Near plane 40, not 1. A near of 1 threw away almost the entire depth buffer
+// on range this camera never occupies: at 2000 units out it left surfaces less
+// than ~0.25 units apart inseparable, and the arena stacks its floor, markings,
+// hazard pads and rims well inside that — so they interleaved per-pixel and
+// read as dense stripes and saw-toothed edges. It looked exactly like aliasing,
+// which is why four rounds of anti-aliasing work (8x MSAA, 4096 shadows,
+// triangle rims, 2.5x supersampling) all failed to touch it: depth precision is
+// not something more samples can fix. 40 buys ~40x the precision for free.
+// 40 is a CEILING, not a safe margin with room to spare. The focus zoom and the
+// victory framing can pull the camera to roughly 110 units from its target, and
+// screen shake to about 75; long weapon FX geometry extends further still. Do
+// not raise this without re-checking the closest approach in updateCam.
+const camera = new T.PerspectiveCamera(48, 16 / 9, 40, 8000);
 
 // lights: bright neutral ambient + white studio key (shadows) + soft accent fills.
 // Intensities tuned so the floor sits ~0.6 luminance — bright TV pit, but safely
 // BELOW the bloom threshold (blown-out white floor was the first-pass failure).
-scene.add(new T.HemisphereLight(0xaec4e0, 0x2a3140, 0.75));
+scene.add(new T.HemisphereLight(0xaec4e0, 0x3a3126, 0.55));
 const key = new T.DirectionalLight(0xffffff, 1.25);
 key.position.set(-400, 900, 300);
 key.castShadow = true;
-key.shadow.mapSize.set(2048, 2048);
+// 1024 over an 1800x1400 frustum is 1.8 world units per texel — every shadow
+// edge staircased in ~2-unit steps. 2048 takes that to 0.9, still below a
+// floor tile. 4096 was tuned against frame rate on one dev machine; the venue
+// GPU is an unknown, so don't spend the extra texture budget on headroom that
+// was never actually measured there.
+const SHADOW_RES = Math.min(2048, renderer.capabilities.maxTextureSize);
+key.shadow.mapSize.set(SHADOW_RES, SHADOW_RES);
 key.shadow.camera.near = 100; key.shadow.camera.far = 2600;
 const sc = key.shadow.camera;
 sc.left = -900; sc.right = 900; sc.top = 700; sc.bottom = -700;
-key.shadow.bias = -0.0006;
+// normalBias offsets along the surface normal, which is what actually kills the
+// acne banding on the big flat floor; the constant bias alone could not without
+// detaching contact shadows.
+key.shadow.bias = -0.0002;
+key.shadow.normalBias = 1.2;
 scene.add(key);
 // broad soft fill from the opposite side so the pit stays bright and readable
-const fillKey = new T.DirectionalLight(0xdfe8f5, 0.4); fillKey.position.set(500, 600, -400); scene.add(fillKey);
+const fillKey = new T.DirectionalLight(0xdfe8f5, 0.25); fillKey.position.set(500, 600, -400); scene.add(fillKey);
 const fill1 = new T.PointLight(0x8fd8ff, 0.35, 2400); fill1.position.set(-700, 300, -500); scene.add(fill1);
 const fill2 = new T.PointLight(0xffd8b0, 0.30, 2400); fill2.position.set(700, 300, 500); scene.add(fill2);
 
@@ -230,14 +300,287 @@ function updateCamFlashes(dt) {
   });
 }
 
+// ----- the crowd ------------------------------------------------------------
+// Spectators are drawn, not downloaded. Both pages are already 10MB and 22MB
+// self-contained bundles, so a photographic crowd sheet would have cost more
+// than everything else on the boards put together; a canvas atlas costs bytes
+// measured in the code that draws it.
+//
+// The atlas holds four poses side by side and carries MASKS, not colour: red
+// channel = shirt, green = skin, blue = hair, alpha = coverage. The shader
+// recolours each figure from per-instance attributes, so 4 drawn poses become
+// thousands of visibly different people.
+const CROWD_POSES = 4, CROWD_CELL_W = 128, CROWD_CELL_H = 192;
+function crowdAtlas() {
+  const c = document.createElement("canvas");
+  c.width = CROWD_CELL_W * CROWD_POSES; c.height = CROWD_CELL_H;
+  const g = c.getContext("2d");
+  const SHIRT = "#ff0000", SKIN = "#00ff00", HAIR = "#0000ff";
+  // arm angles per pose: sitting, leaning in, one arm up, both arms up
+  const POSE = [
+    { lean: 0.00, la: 0.18, ra: -0.18, rise: 0 },
+    { lean: 0.16, la: 0.34, ra: -0.30, rise: 0 },
+    { lean: 0.04, la: 0.20, ra: -2.30, rise: 6 },
+    { lean: 0.00, la: 2.30, ra: -2.30, rise: 10 },
+  ];
+  const limb = (x, y, len, w, ang) => {
+    g.save(); g.translate(x, y); g.rotate(ang);
+    g.beginPath(); g.moveTo(0, 0); g.lineTo(0, len);
+    g.lineWidth = w; g.lineCap = "round"; g.stroke(); g.restore();
+  };
+  for (let p = 0; p < CROWD_POSES; p++) {
+    const P = POSE[p], ox = p * CROWD_CELL_W;
+    g.save(); g.translate(ox + CROWD_CELL_W / 2, CROWD_CELL_H);
+    g.rotate(P.lean);
+    const shoulderY = -122 - P.rise, headY = -150 - P.rise;
+    // torso: shoulders down to the seat line, slightly tapered
+    g.fillStyle = SHIRT;
+    g.beginPath();
+    g.moveTo(-34, shoulderY); g.lineTo(34, shoulderY);
+    g.quadraticCurveTo(42, shoulderY + 40, 30, 0);
+    g.lineTo(-30, 0);
+    g.quadraticCurveTo(-42, shoulderY + 40, -34, shoulderY);
+    g.closePath(); g.fill();
+    // arms, sleeved in the shirt colour
+    g.strokeStyle = SHIRT;
+    limb(-32, shoulderY + 10, 62, 20, P.la);
+    limb(32, shoulderY + 10, 62, 20, P.ra);
+    // hands at the end of each arm
+    g.strokeStyle = SKIN;
+    limb(-32 + Math.sin(P.la) * 56, shoulderY + 10 + Math.cos(P.la) * 56, 14, 18, P.la);
+    limb(32 + Math.sin(P.ra) * 56, shoulderY + 10 + Math.cos(P.ra) * 56, 14, 18, P.ra);
+    // neck + head
+    g.strokeStyle = SKIN; limb(0, shoulderY - 6, 14, 22, 0);
+    g.fillStyle = SKIN;
+    g.beginPath(); g.ellipse(0, headY, 23, 26, 0, 0, Math.PI * 2); g.fill();
+    // hair cap over the back of the skull
+    g.fillStyle = HAIR;
+    g.beginPath(); g.ellipse(0, headY - 5, 24, 22, 0, Math.PI, Math.PI * 2); g.fill();
+    g.restore();
+  }
+  const tex = new T.CanvasTexture(c);
+  tex.colorSpace = T.NoColorSpace;   // masks, not colour: no sRGB decode
+  tex.minFilter = T.LinearMipmapLinearFilter; tex.magFilter = T.LinearFilter;
+  tex.generateMipmaps = true; tex.anisotropy = MAX_ANISO;
+  return tex;
+}
+
+// Seat positions come off the geometry, not off a guess: drop a ray onto the
+// modelled `Seats` ring and keep where it lands. The five map presets share a
+// bowl profile but not a footprint, so anything analytic here would be right
+// for one arena and wrong for four.
+// Derived from the board ring rather than written out again: the two numbers
+// have to move together, and the first version of this hard-coded a clearance
+// that quietly emptied four of the bowl's five tiers when the boards moved.
+// Read at call time, not at load: AD_GLB is declared further down the file.
+const crowdClear = () => adRing().outset + 15;
+const CROWD_MIN_H = 46;   // shortest figure; also the head-clears-the-board test
+// Nobody is seated where a hoarding would swallow them whole. A spectator whose
+// head does not clear the top of the board in front is a spectator you never
+// see — and the step they would have sat on is hidden behind that same board
+// from every camera height, so leaving it empty costs nothing and reads right.
+// A quarter of a figure showing above the board is the threshold for seating
+// them at all — clearing it by a hair reads as a row of floating heads.
+const crowdMinSeatY = () => adRing().base + AD_BH - CROWD_MIN_H * 0.75;
+function crowdSeatPoints(group, count) {
+  const pts = [];
+  // The model is added and scaled x10 in the same tick this runs, so its world
+  // matrices are still the unscaled ones until the next render. Without this
+  // the seat ring measures a tenth of its real size, every sample lands inside
+  // the pit filter, and the crowd comes out empty with nothing thrown.
+  group.updateMatrixWorld(true);
+  // Raycast the whole stepped structure, not the `Seats` mesh alone. `Seats`
+  // only skins alternate tiers of the modelled bowl — sample it at four depths
+  // and two of them miss it entirely, landing on `Stands` a full step higher.
+  // Standing figures on `Seats` therefore sank them into the step in front and
+  // the depth buffer sliced each row along a dead-straight line, which on screen
+  // is a stand full of people cut off at the waist.
+  //
+  // Name-matched rather than "every mesh": the colonnade, lintel, banners and
+  // floodlights all sit ABOVE the seating, so a ray dropped from overhead hits
+  // those first and would seat the crowd on the roof.
+  const surfaces = [];
+  group.traverse((o) => {
+    if (o.isMesh && !o.isSkinnedMesh && o.geometry && /stand|seat|tier|step/i.test(o.name)) surfaces.push(o);
+  });
+  const seats = surfaces.length ? surfaces : null;
+  if (seats) {
+    const box = new T.Box3();
+    seats.forEach((s) => box.expandByObject(s));
+    const rc = new T.Raycaster(), down = new T.Vector3(0, -1, 0);
+    const from = new T.Vector3();
+    // Seating starts BEHIND the hoardings. The bowl's front rows are inside the
+    // board ring, and filling them puts a wall of spectators between the camera
+    // and the advertising — which is the one thing the boards exist to avoid.
+    const clear = crowdClear();
+    const innerX = AW / 2 + clear, innerZ = AH / 2 + clear;
+    const minSeatY = crowdMinSeatY();
+    const depthX = box.max.x - innerX, depthZ = box.max.z - innerZ;
+    if (depthX <= 0 && depthZ <= 0) return pts;
+    for (let guard = 0; pts.length < count && guard < count * 6; guard++) {
+      // aim straight at the seating band rather than at the whole bounding box:
+      // most of that box is the pit, and rejection sampling it wastes the budget
+      const side = (Math.random() * 4) | 0;
+      let x, z;
+      if (side < 2) {
+        if (depthZ <= 0) continue;
+        x = (Math.random() * 2 - 1) * box.max.x;
+        z = (side ? 1 : -1) * (innerZ + Math.random() * depthZ);
+      } else {
+        if (depthX <= 0) continue;
+        x = (side === 2 ? 1 : -1) * (innerX + Math.random() * depthX);
+        z = (Math.random() * 2 - 1) * box.max.z;
+      }
+      from.set(x, box.max.y + 200, z);
+      rc.set(from, down);
+      const h = rc.intersectObjects(seats, false)[0];   // nearest from above = the step they stand on
+      if (h && h.point.y >= minSeatY) pts.push(new T.Vector3(x, h.point.y, z));
+    }
+    return pts;
+  }
+  // procedural stands: stepped boxes, so the seat height is known outright
+  const tiers = 5, step = 60, riseH = 46, halfW = AW / 2, halfH = AH / 2;
+  // same rule as the modelled bowl: start at the first tier whose occupants
+  // clear the boards, rather than filling rows the hoardings hide
+  const minSeatY = crowdMinSeatY();
+  const tier0 = Math.max(0, Math.ceil((minSeatY - riseH - 2) / riseH));
+  if (tier0 >= tiers) return pts;
+  for (let i = 0; i < count; i++) {
+    const t = tier0 + ((Math.random() * (tiers - tier0)) | 0);
+    // Tier t's box is centred half a step inside `120 + t * step`, so its tread
+    // runs from 60 + t*step. Standing people on 120 + t*step put every row on
+    // the NEXT tier's footprint at its own tier's height — buried to the neck
+    // in the riser behind, which is what "only heads" looked like on screen.
+    const off = 60 + t * step + Math.random() * step;
+    const y = t * riseH + riseH + 2;
+    const side = i % 4;
+    if (side === 0) pts.push(new T.Vector3((Math.random() - 0.5) * (AW + off * 2), y, -halfH - off));
+    else if (side === 1) pts.push(new T.Vector3((Math.random() - 0.5) * (AW + off * 2), y, halfH + off));
+    else if (side === 2) pts.push(new T.Vector3(-halfW - off, y, (Math.random() - 0.5) * (AH + off * 2)));
+    else pts.push(new T.Vector3(halfW + off, y, (Math.random() - 0.5) * (AH + off * 2)));
+  }
+  return pts;
+}
+
+// Broad enough that no two neighbours read as clones at broadcast distance,
+// muted enough that the crowd stays a backdrop and the robots stay the subject.
+const CROWD_SHIRTS = [
+  0x2f3a4f, 0x3d4a63, 0x1f2733, 0x4a3f52, 0x5a4433, 0x334a3f, 0x53303a, 0x2b4257,
+  0x6b6f78, 0x8a8f99, 0x3fd0c9, 0xff4d4d, 0xffd93d, 0x5fe0d8, 0xff9f43, 0xb983ff,
+];
+const CROWD_SKINS = [0xf0c8a0, 0xe0ac82, 0xc68863, 0x8d5524, 0x5c3317, 0xffdbac];
+const CROWD_HAIRS = [0x1a1512, 0x2c2018, 0x4a3728, 0x6b4a2f, 0x8c6239, 0xa8a8a8, 0x1f1f24];
+
+const CROWD_VERT = `
+  attribute vec3 iPos; attribute vec3 iShirt; attribute vec3 iSkin; attribute vec3 iHair;
+  attribute float iScale; attribute float iPose; attribute float iPhase; attribute float iShade;
+  uniform float u_time; uniform float u_cellW;
+  varying vec2 vUv; varying vec3 vShirt; varying vec3 vSkin; varying vec3 vHair; varying float vShade;
+  void main() {
+    vShirt = iShirt; vSkin = iSkin; vHair = iHair; vShade = iShade;
+    vUv = vec2((uv.x + iPose) * u_cellW, uv.y);
+    // idle bob, plus a narrow band travelling round the bowl: the wave is what
+    // stops a still crowd from reading as wallpaper
+    float ang = atan(iPos.z, iPos.x);
+    float wave = pow(max(0.0, sin(ang - u_time * 0.55)), 12.0);
+    float bob = sin(u_time * 2.3 + iPhase) * 0.018;
+    float h = iScale * (1.0 + bob);
+    vec4 mv = modelViewMatrix * vec4(iPos, 1.0);
+    mv.y += wave * iScale * 0.42;
+    mv.xy += vec2(position.x * h * 0.667, (position.y + 0.5) * h);
+    gl_Position = projectionMatrix * mv;
+  }`;
+// ACES + sRGB written out longhand rather than pulled in as three's shader
+// chunks. This build is r150, where the chunk is `encodings_fragment`; it was
+// renamed `colorspace_fragment` in r152, and a raw ShaderMaterial does not get
+// the matching `_pars_` chunk injected for it either way. Inlining the two
+// conversions keeps the crowd graded like the rest of the scene across either.
+const CROWD_FRAG = `
+  uniform sampler2D u_map; uniform float u_exposure;
+  varying vec2 vUv; varying vec3 vShirt; varying vec3 vSkin; varying vec3 vHair; varying float vShade;
+  vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+  }
+  void main() {
+    vec4 t = texture2D(u_map, vUv);
+    if (t.a < 0.4) discard;
+    vec3 col = (vShirt * t.r + vSkin * t.g + vHair * t.b) * vShade;
+    col = aces(col * u_exposure);
+    col = mix(col * 12.92,
+              1.055 * pow(col, vec3(0.41666)) - 0.055,
+              step(0.0031308, col));
+    gl_FragColor = vec4(col, 1.0);
+  }`;
+
+// ~4600 figures in one draw call. InstancedBufferGeometry rather than
+// InstancedMesh: every figure is a camera-facing quad, so a per-instance
+// matrix would be 16 floats spent to store a position we billboard away.
+function buildCrowdFigures(group) {
+  const COUNT = 4600;
+  const pts = crowdSeatPoints(group, COUNT);
+  crowdSeats = pts;
+  if (!pts.length) return null;
+  const n = pts.length;
+  const src = new T.PlaneGeometry(1, 1);
+  const geo = new T.InstancedBufferGeometry();
+  geo.setAttribute("position", src.getAttribute("position"));
+  geo.setAttribute("uv", src.getAttribute("uv"));
+  geo.setIndex(src.getIndex());
+  geo.instanceCount = n;
+
+  const iPos = new Float32Array(n * 3), iShirt = new Float32Array(n * 3);
+  const iSkin = new Float32Array(n * 3), iHair = new Float32Array(n * 3);
+  const iScale = new Float32Array(n), iPose = new Float32Array(n);
+  const iPhase = new Float32Array(n), iShade = new Float32Array(n);
+  const col = new T.Color();
+  for (let i = 0; i < n; i++) {
+    const p = pts[i];
+    iPos[i * 3] = p.x; iPos[i * 3 + 1] = p.y; iPos[i * 3 + 2] = p.z;
+    col.setHex(CROWD_SHIRTS[(Math.random() * CROWD_SHIRTS.length) | 0]);
+    iShirt[i * 3] = col.r; iShirt[i * 3 + 1] = col.g; iShirt[i * 3 + 2] = col.b;
+    col.setHex(CROWD_SKINS[(Math.random() * CROWD_SKINS.length) | 0]);
+    iSkin[i * 3] = col.r; iSkin[i * 3 + 1] = col.g; iSkin[i * 3 + 2] = col.b;
+    col.setHex(CROWD_HAIRS[(Math.random() * CROWD_HAIRS.length) | 0]);
+    iHair[i * 3] = col.r; iHair[i * 3 + 1] = col.g; iHair[i * 3 + 2] = col.b;
+    iScale[i] = CROWD_MIN_H + Math.random() * 10;
+    // mostly seated; a scattering already on their feet
+    const r = Math.random();
+    iPose[i] = r < 0.5 ? 0 : r < 0.8 ? 1 : r < 0.93 ? 2 : 3;
+    iPhase[i] = Math.random() * Math.PI * 2;
+    iShade[i] = 0.5 + Math.random() * 0.22;   // house lights are down over the stands
+  }
+  const put = (name, arr, size) =>
+    geo.setAttribute(name, new T.InstancedBufferAttribute(arr, size));
+  put("iPos", iPos, 3); put("iShirt", iShirt, 3); put("iSkin", iSkin, 3);
+  put("iHair", iHair, 3); put("iScale", iScale, 1); put("iPose", iPose, 1);
+  put("iPhase", iPhase, 1); put("iShade", iShade, 1);
+
+  const mat = new T.ShaderMaterial({
+    uniforms: { u_map: { value: crowdAtlas() }, u_time: { value: 0 },
+                u_cellW: { value: 1 / CROWD_POSES },
+                u_exposure: { value: renderer.toneMappingExposure } },
+    vertexShader: CROWD_VERT, fragmentShader: CROWD_FRAG,
+  });
+  const mesh = new T.Mesh(geo, mat);
+  mesh.frustumCulled = false;   // instances live outside the source geometry's bounds
+  group.add(mesh);
+  crowdCount = n;
+  return mat;
+}
+// surfaced on RW.debug: a crowd that silently fails to place is invisible in
+// exactly the same way as a crowd that is simply behind the camera
+let crowdCount = 0;
+let crowdSeats = [];   // reused to put the phone lights in somebody's hands
+
 // ----- procedural textures (no external files) -----------------------------
 function floorTexture() {
   const c = document.createElement("canvas"); c.width = c.height = 1024;
   const g = c.getContext("2d");
-  // painted concrete combat pit — mid-grey base (bright enough to read on a projector)
-  g.fillStyle = "#59606e"; g.fillRect(0, 0, 1024, 1024);
+  // painted concrete combat pit — darker structured base (subject pops off it)
+  g.fillStyle = "#454c59"; g.fillRect(0, 0, 1024, 1024);
   // subtle panel seams (large 4x4 plates)
-  g.strokeStyle = "rgba(20,24,32,0.35)"; g.lineWidth = 3;
+  g.strokeStyle = "rgba(20,24,32,0.55)"; g.lineWidth = 3;
   for (let i = 1; i < 4; i++) {
     const p = i / 4 * 1024;
     g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 1024); g.stroke();
@@ -256,6 +599,13 @@ function floorTexture() {
     g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 1024); g.stroke();
     g.beginPath(); g.moveTo(0, p); g.lineTo(1024, p); g.stroke();
   }
+  // painted pitch markings: center circle + team-colored end-zone stripes
+  g.strokeStyle = "rgba(230,238,248,0.45)"; g.lineWidth = 6;
+  g.beginPath(); g.arc(512, 512, 150, 0, 7); g.stroke();
+  g.fillStyle = "rgba(230,238,248,0.45)";
+  g.beginPath(); g.arc(512, 512, 9, 0, 7); g.fill();
+  g.fillStyle = "rgba(63,208,201,0.28)"; g.fillRect(6, 60, 84, 904);
+  g.fillStyle = "rgba(255,107,107,0.28)"; g.fillRect(934, 60, 84, 904);
   // hazard chevron border stripes (yellow/black) — classic combat-arena marking
   const cw = 26;
   for (let i = 0; i < 40; i++) {
@@ -329,28 +679,254 @@ function softSprite() {
 const SPARK_TEX = softSprite();
 initCamFlashes();
 
+// ----- pitch-side advertising hoardings -------------------------------------
+// Football-style boards ringing the arena, angled back so they read from the
+// broadcast cameras. Out of the box every board is a plain white plate with a
+// coloured strip along its base, which is what an unbranded arena looks like.
+//
+// To put real marks on them: drop trimmed PNGs into src/assets/bu-logos/ named
+// <slug>.png and point the slugs below at them. assets_js.py inlines whatever
+// it finds as data URIs, so the page stays one offline file. A slug with no PNG
+// draws a blank plate rather than failing, so a partial set is fine.
+//
+// Boards draw white immediately and the logo lands when it decodes. A map
+// attached after a mesh's first render never recompiles, so the texture is
+// built first and flagged in the image's onload.
+//
+// `accent` is the strip along the board's base. Grouping slugs by colour is
+// what makes the ring read as one system rather than a row of loose plates.
+const AD_UNITS = [
+  { slug: "unit-01", accent: "#3fd0c9" },
+  { slug: "unit-02", accent: "#3fd0c9" },
+  { slug: "unit-03", accent: "#3fd0c9" },
+  { slug: "unit-04", accent: "#3fd0c9" },
+  { slug: "unit-05", accent: "#3fd0c9" },
+  { slug: "unit-06", accent: "#3fd0c9" },
+  { slug: "unit-07", accent: "#3fd0c9" },
+  { slug: "unit-08", accent: "#3fd0c9" },
+  { slug: "unit-09", accent: "#ff4d4d" },
+  { slug: "unit-10", accent: "#ff4d4d" },
+  { slug: "unit-11", accent: "#ff4d4d" },
+  { slug: "unit-12", accent: "#ff4d4d" },
+  { slug: "unit-13", accent: "#ff9f43" },
+  { slug: "unit-14", accent: "#ff9f43" },
+  { slug: "unit-15", accent: "#ff9f43" },
+  { slug: "unit-16", accent: "#ffd93d" },
+  { slug: "unit-17", accent: "#ffd93d" },
+  { slug: "unit-18", accent: "#5fe0d8" },
+  { slug: "unit-19", accent: "#5fe0d8" },
+  { slug: "unit-20", accent: "#5fe0d8" },
+  { slug: "unit-21", accent: "#6ee7a8" },
+  { slug: "unit-22", accent: "#6ee7a8" },
+  { slug: "unit-23", accent: "#b983ff" },
+];
+
+// Canvas is 512x208 (~2.5:1) to match the board's own proportions — art cut for
+// a wider ratio arrives on the mesh visibly stretched.
+const AD_W = 512, AD_H = 208;
+
+// Anisotropic filtering + mipmaps. Without these, fine repeating detail (board
+// rules, hatched panels) breaks into crawling moire once a surface is distant
+// or steeply raked — the "lines on everything from a distance".
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+// isColor: only colour maps carry sRGB. Forcing it on normal/roughness data
+// would wash the lighting out.
+function sharpTexture(tex, isColor) {
+  tex.anisotropy = MAX_ANISO;
+  tex.generateMipmaps = true;
+  tex.minFilter = T.LinearMipmapLinearFilter;
+  tex.magFilter = T.LinearFilter;
+  if (isColor) tex.colorSpace = T.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Accent strip along the base. Pure white plate, not the off-white the rest of
+// the UI chrome uses: a good few of these marks ship with their own white
+// background baked in, and against #f4f6f9 that box shows up as a visible
+// rectangle sitting on the board.
+const AD_STRIP = 16;
+
+function adBoardTexture(spec) {
+  const c = document.createElement("canvas"); c.width = AD_W; c.height = AD_H;
+  const g = c.getContext("2d");
+  g.fillStyle = "#ffffff"; g.fillRect(0, 0, AD_W, AD_H);
+  if (spec.accent) { g.fillStyle = spec.accent; g.fillRect(0, AD_H - AD_STRIP, AD_W, AD_STRIP); }
+
+  // Build the texture BEFORE the image resolves. A CanvasTexture whose map is
+  // attached after the mesh's first render never recompiles, so the board would
+  // stay blank; drawing into the same canvas and flagging needsUpdate is what
+  // actually lands the logo on screen.
+  const tex = sharpTexture(new T.CanvasTexture(c), true);
+  const src = spec.brand
+    ? window.__BRAND_LOGO_COLOR__
+    : (window.__BU_LOGOS__ || {})[spec.slug];
+  if (typeof src === "string") {
+    const img = new Image();
+    img.onload = () => {
+      // Contain-fit inside the plate, clear of the accent strip. The source PNGs
+      // are already trimmed to the ink, so this fills the board rather than
+      // fitting a square of white padding to the board's height.
+      const padX = 26, padY = 16;
+      const boxW = AD_W - padX * 2, boxH = AD_H - AD_STRIP - padY * 2;
+      const s = Math.min(boxW / img.width, boxH / img.height);
+      const w = img.width * s, h = img.height * s;
+      g.drawImage(img, (AD_W - w) / 2, padY + (boxH - h) / 2, w, h);
+      tex.needsUpdate = true;
+    };
+    img.src = src;
+  }
+  return tex;
+}
+
+// A cursor rather than the board index, and module-level rather than per-build,
+// for two reasons. Indexing the list by board index skipped every array entry
+// whose position shared a factor with the every-3rd house board, which with
+// twenty-one units meant seven of them never appeared at all. And one arena only
+// has room for sixteen unit boards, so restarting the cursor each build would
+// show the same sixteen units every match; letting it carry over gives a
+// bracket's worth of matches enough rotations to put every unit on screen.
+let adUnitCursor = 0;
+
+// Every 3rd board carries the house mark so it reads on any camera angle.
+function adBoardSpec(i) {
+  if (i % 3 === 0) return { brand: true };
+  const spec = AD_UNITS[adUnitCursor];
+  adUnitCursor = (adUnitCursor + 1) % AD_UNITS.length;
+  return spec;
+}
+
+// Where the hoardings hang on the modelled bowl. They used to stand 120 out,
+// which put them a third of the way into the seating: the boards read fine but
+// every spectator in the front tiers was either in front of the advertising or
+// had to be left out to protect it. Measured off the model, the kerb's outer
+// face ends at 14 past the pit and its top is 26 high, and the first seating
+// tier does not begin until ~64 past the pit — so 30 out drops the boards into
+// clear air on the kerb, exactly where trackside hoardings go, and hands the
+// whole bowl back to the crowd.
+//
+// The base is NOT the kerb's 26. Raycasting a board at this outset from four
+// camera heights across all five presets, the height at which a board first
+// clears everything in front of it is 25.0 (classic), 25.4 (pillars), 25.8
+// (colosseum), 38.0 (arena) and 40.9 (gauntlet) — the last two mount their
+// kerbs higher. 46 clears the worst of them by 5.
+const AD_GLB = { outset: 30, base: 46 };
+// The procedural pit has the same shape of problem and had it worse: its boards
+// were floor-mounted at 2 behind a kerb 26 high, so the kerb ate the bottom
+// quarter of every board on that path. 30 clears it.
+const AD_PROC = { outset: 26, base: 30 };
+const AD_BH = 84;   // board height, shared with the crowd's seating cutoff
+const adRing = () => (glbArenaActive ? AD_GLB : AD_PROC);
+function buildAdBoards(group, aw, ah, outset, base) {
+  // `base` lifts the boards clear of whatever ring sits in front of them: the
+  // procedural kerb and the modelled one are both 26 tall, so both want a base
+  // just above that rather than a floor mounting.
+  const BH = AD_BH, BASE = base || 2, TILT = -0.14;   // ~8deg lean back
+  // The walk-on drives each bot in through a tunnel at the MIDPOINT of a side
+  // (see `gates` in the entrance code). Boarding straight across the span puts
+  // a hoarding over every tunnel mouth, so leave the centre of each side open.
+  const GATE_GAP = 200;
+  let idx = 0;
+  const side = (span, cx, cz, ry) => {
+    const n = Math.max(3, Math.round(span / 210));
+    const bw = span / n;
+    for (let i = 0; i < n; i++) {
+      const off = -span / 2 + bw * (i + 0.5);
+      if (Math.abs(off) < GATE_GAP) continue;      // tunnel mouth
+      const holder = new T.Group();
+      holder.position.set(cx + Math.cos(ry) * off, BASE + BH / 2, cz - Math.sin(ry) * off);
+      holder.rotation.y = ry;
+      // FrontSide, not DoubleSide: a hoarding seen from behind renders its
+      // artwork mirrored, and the camera is regularly outside the far boards.
+      const m = new T.Mesh(new T.PlaneGeometry(bw * 0.96, BH),
+        new T.MeshBasicMaterial({ map: adBoardTexture(adBoardSpec(idx++)), side: T.FrontSide }));
+      m.rotation.x = TILT;
+      holder.add(m);
+      group.add(holder);
+    }
+  };
+  // ry aims the plane's +Z normal INTO the arena: normal = (sin ry, 0, cos ry).
+  side(aw, 0, ah / 2 + outset, Math.PI);        // near side  -> normal -z
+  side(aw, 0, -ah / 2 - outset, 0);             // far side   -> normal +z
+  side(ah, -aw / 2 - outset, 0, Math.PI / 2);   // left       -> normal +x
+  side(ah, aw / 2 + outset, 0, -Math.PI / 2);   // right      -> normal -x
+}
+
 // Billboard screen mesh. The finished artwork gets a BRAND-NEW material built
 // around its texture: this three build never recompiles an already-rendered
 // material to include a later-attached map (the screens rendered their
 // mapless base state forever), so we swap the whole material instead.
-function jumboScreen(w, h) {
+function jumboScreen(w, h, opts) {
   const mesh = new T.Mesh(new T.PlaneGeometry(w, h),
     new T.MeshBasicMaterial({ color: 0xf4f6f9, side: T.DoubleSide }));
+  mesh.userData.staticMaterial = mesh.material;
+  const attach = () => {
+    const material = new T.MeshBasicMaterial({ map: new T.CanvasTexture(c), side: T.DoubleSide });
+    mesh.userData.staticMaterial = material;
+    if (!mesh.userData.liveFeed) mesh.material = material;
+  };
+  const enableFeed = () => {
+    // Live board: mirror the completed broadcast into a dedicated texture,
+    // rather than sampling a bloom working target or running a second camera.
+    if (!(opts && opts.feed && bloom.ok && bloom.feedTexture)) return;
+    const buf = renderer.getDrawingBufferSize(new T.Vector2());
+    const srcAspect = buf.x / Math.max(1, buf.y), dstAspect = w / h;
+    const repeat = new T.Vector2(1, 1), offset = new T.Vector2(0, 0);
+    if (srcAspect < dstAspect) {
+      repeat.y = srcAspect / dstAspect;
+      offset.y = (1 - repeat.y) / 2;
+    } else {
+      repeat.x = dstAspect / srcAspect;
+      offset.x = (1 - repeat.x) / 2;
+    }
+    mesh.userData.feedRepeat = repeat;
+    mesh.userData.feedOffset = offset;
+    jumboFeedScreen = mesh;
+  };
   const c = document.createElement("canvas"); c.width = 512; c.height = 256;
   const g = c.getContext("2d");
-  const colorLogo = typeof window.__HARRIS_LOGO_COLOR__ === "string";
-  const attach = () => {
-    mesh.material = new T.MeshBasicMaterial({ map: new T.CanvasTexture(c), side: T.DoubleSide });
-  };
+  const colorLogo = typeof window.__BRAND_LOGO_COLOR__ === "string";
+  if (colorLogo && opts && opts.brand) {
+    // The corner televisions carry the event lock-up rather than a second copy
+    // of the sponsor plate: mark on top, event name under it. Same white plate
+    // and same teal base strip as the hoardings, so the ring and the screens
+    // read as one dressing job instead of two.
+    g.fillStyle = "#ffffff"; g.fillRect(0, 0, 512, 256);
+    g.fillStyle = "#3fd0c9"; g.fillRect(0, 236, 512, 20);
+    const img = new Image();
+    img.onload = () => {
+      const w = 250, h = w * img.height / img.width;
+      g.drawImage(img, (512 - w) / 2, 30, w, h);
+      g.textAlign = "center";
+      g.fillStyle = "#12414f"; g.font = "900 46px ui-sans-serif, sans-serif";
+      g.fillText("ROBOT WARS", 256, 178);
+      // letterspacing by hand: canvas has no tracking control in this build
+      g.fillStyle = "#5c6b78"; g.font = "700 21px ui-sans-serif, sans-serif";
+      const word = "INTERNATIONAL", track = 7;
+      const widths = [...word].map((ch) => g.measureText(ch).width);
+      let x = 256 - (widths.reduce((a, b) => a + b, 0) + track * (word.length - 1)) / 2;
+      g.textAlign = "left";
+      [...word].forEach((ch, i) => { g.fillText(ch, x, 214); x += widths[i] + track; });
+      attach();
+    };
+    img.src = window.__BRAND_LOGO_COLOR__;
+    return mesh;
+  }
   if (colorLogo) {
-    // sponsor billboard: the full-colour company logo on a clean white board
-    g.fillStyle = "#f4f6f9"; g.fillRect(0, 0, 512, 256);
+    // sponsor billboard: the full-colour company logo on a clean white board.
+    // Pure white, not off-white, for the same reason the ad boards are: the
+    // logo PNG carries its own white background, and against #f4f6f9 that
+    // shows up as a rectangle sitting on the screen.
+    g.fillStyle = "#ffffff"; g.fillRect(0, 0, 512, 256);
     g.fillStyle = "#dfe4ec"; g.fillRect(0, 246, 512, 10);   // subtle base strip
     const img = new Image();
     img.onload = () => {
-      const pad = 36;
-      const s = Math.min((512 - pad * 2) / img.width, (256 - pad * 2) / img.height);
-      const w = img.width * s, h = img.height * s;
+      // A fixed share of the plate, not a fit to a padded box. The source PNG
+      // used to carry a wide white margin and was trimmed to its ink so the ad
+      // boards could fill properly; fitting the trimmed mark to the old box
+      // would have blown it up by two thirds on this screen. 268px keeps the
+      // jumbotron mark exactly the size it has been.
+      const w = 268, h = w * img.height / img.width;
       g.drawImage(img, (512 - w) / 2, (256 - h) / 2, w, h);
       // LIVE bug in the corner so it still reads as a broadcast screen
       g.fillStyle = "#ff3b3b"; g.beginPath(); g.arc(446, 30, 8, 0, 7); g.fill();
@@ -358,10 +934,11 @@ function jumboScreen(w, h) {
       g.textAlign = "left"; g.fillText("LIVE", 460, 37);
       attach();
     };
-    img.src = window.__HARRIS_LOGO_COLOR__;
+    img.src = window.__BRAND_LOGO_COLOR__;
+    enableFeed();
     return mesh;
   }
-  const hasLogo = typeof window.__HARRIS_LOGO__ === "string";
+  const hasLogo = typeof window.__BRAND_LOGO__ === "string";
   function draw() {
     g.fillStyle = "#070b14"; g.fillRect(0, 0, 512, 256);
     g.strokeStyle = "rgba(63,208,201,0.25)"; g.lineWidth = 1;
@@ -371,42 +948,43 @@ function jumboScreen(w, h) {
     g.fillStyle = "#3fd0c9"; g.font = "900 58px ui-sans-serif, sans-serif";
     g.fillText("ROBOT WARS", 256, hasLogo ? 132 : 110);
     g.fillStyle = "#7e8aa0"; g.font = "700 22px ui-sans-serif, sans-serif";
-    g.fillText(hasLogo ? "ALL HANDS WORKSHOP" : "HARRIS ALL HANDS WORKSHOP", 256, hasLogo ? 168 : 150);
+    g.fillText("ROBOT WARS", 256, hasLogo ? 168 : 150);
     g.fillStyle = "#ff5d5d"; g.beginPath(); g.arc(196, hasLogo ? 208 : 196, 9, 0, 7); g.fill();
     g.fillStyle = "#fff"; g.font = "800 26px ui-sans-serif, sans-serif"; g.textAlign = "left";
     g.fillText("LIVE", 214, hasLogo ? 217 : 205);
   }
   draw();
   if (hasLogo) {
-    // real Harris logo (data URI SVG — decodes offline, no fetch) across the top
+    // house logo (data URI SVG: decodes offline, no fetch) across the top
     const img = new Image();
     img.onload = () => {
       const w = 190, h = w * (img.height / img.width) || 60;   // svg aspect ≈ 3.15
       g.drawImage(img, 256 - w / 2, 14, w, h);
       attach();
     };
-    img.src = window.__HARRIS_LOGO__;
+    img.src = window.__BRAND_LOGO__;
   } else {
     attach();
   }
+  enableFeed();
   return mesh;
 }
-// Harris logo in the page header (arena + tournament shells both have <header>)
+// House logo in the page header (arena + tournament shells both have <header>)
 (function () {
-  if (typeof window.__HARRIS_LOGO__ !== "string") return;
+  if (typeof window.__BRAND_LOGO__ !== "string") return;
   const h = document.querySelector("header");
   if (!h) return;
   const img = document.createElement("img");
-  img.src = window.__HARRIS_LOGO__; img.alt = "Harris";
+  img.src = window.__BRAND_LOGO__; img.alt = "Robot Wars";
   img.style.cssText = "height:20px;margin-right:10px;flex:none;";
   h.insertBefore(img, h.firstChild);
 })();
 
 // animated env refs (rebuilt with the arena)
-let envAnim = { hazards: [], jumbos: [], crowd: null };
+let envAnim = { hazards: [], jumbos: [], crowd: null, people: null };
 let glbArenaActive = false;   // Blender arena brings its own colosseum bowl
 function buildEnvironment() {
-  envAnim = { hazards: [], jumbos: [], crowd: null };
+  envAnim = { hazards: [], jumbos: [], crowd: null, people: null };
   const halfW = AW / 2, halfH = AH / 2;
 
   // tiered crowd stands around the arena (stepped dark boxes) — the Blender
@@ -425,39 +1003,75 @@ function buildEnvironment() {
       mk(step, lenZ, halfW + off - step / 2, 0);
     }
   }
-  // twinkling crowd (dim points along the stands)
-  const CN = 1400, cpos = new Float32Array(CN * 3), ccol = new Float32Array(CN * 3);
+  // stand uplights: 4 low-intensity points washing the tiers; two carry the
+  // live team colors when the match is team-based (global hemi stays down)
+  const rs0 = (frames.length ? frames[0].robots : []).filter((r) => r.team !== "house");
+  const ti0 = teamInfo(rs0);
+  const tcols = (ti0.hasTeams && ti0.order.length >= 2)
+    ? [colorFor(ti0.by[ti0.order[0]][0]), colorFor(ti0.by[ti0.order[1]][0])]
+    : [0xffd0a0, 0xa0c8ff];
+  [[-halfW - 260, -halfH - 260, tcols[0]], [halfW + 260, halfH + 260, tcols[1]],
+   [halfW + 260, -halfH - 260, 0xffe0c0], [-halfW - 260, halfH + 260, 0xc0d4ff]].forEach(([x, z, cc]) => {
+    const up = new T.PointLight(cc, 0.5, 1500, 1.6);
+    up.position.set(x, 100, z);
+    arenaGroup.add(up);
+  });
+
+  // the actual spectators
+  envAnim.people = buildCrowdFigures(arenaGroup);
+
+  // Phone screens, one in every ninth pair of hands. These used to be scattered
+  // on their own footprint, which was derived from the procedural tier maths and
+  // so landed them on bare steps of the modelled bowl — a scatter of lit dots
+  // sitting on empty concrete. Hanging them off the crowd's own seats puts every
+  // light in somebody's hands, in both arenas, for free.
+  const seats = crowdSeats.length ? crowdSeats : null;
+  const CN = seats ? Math.min(1100, (seats.length / 9) | 0) : 1100;
+  const cpos = new Float32Array(CN * 3), ccol = new Float32Array(CN * 3);
   for (let i = 0; i < CN; i++) {
-    const side = i % 4, off = 150 + Math.random() * (tiers * step - 80), y = 30 + (off - 150) / (tiers * step) * (tiers * riseH);
-    let x, z;
-    if (side === 0) { x = (Math.random() - 0.5) * (AW + off * 2); z = -halfH - off; }
-    else if (side === 1) { x = (Math.random() - 0.5) * (AW + off * 2); z = halfH + off; }
-    else if (side === 2) { x = -halfW - off; z = (Math.random() - 0.5) * (AH + off * 2); }
-    else { x = halfW + off; z = (Math.random() - 0.5) * (AH + off * 2); }
-    cpos[i * 3] = x; cpos[i * 3 + 1] = y + Math.random() * 30; cpos[i * 3 + 2] = z;
-    const h = Math.random(); ccol[i * 3] = 0.4 + h * 0.6; ccol[i * 3 + 1] = 0.4 + Math.random() * 0.4; ccol[i * 3 + 2] = 0.5 + Math.random() * 0.5;
+    let x, y, z;
+    if (seats) {
+      const s = seats[(Math.random() * seats.length) | 0];
+      x = s.x; y = s.y + 26 + Math.random() * 10; z = s.z;   // held up at chest height
+    } else {
+      const side = i % 4, off = 150 + Math.random() * (tiers * step - 80);
+      y = 30 + (off - 150) / (tiers * step) * (tiers * riseH) + Math.random() * 30;
+      if (side === 0) { x = (Math.random() - 0.5) * (AW + off * 2); z = -halfH - off; }
+      else if (side === 1) { x = (Math.random() - 0.5) * (AW + off * 2); z = halfH + off; }
+      else if (side === 2) { x = -halfW - off; z = (Math.random() - 0.5) * (AH + off * 2); }
+      else { x = halfW + off; z = (Math.random() - 0.5) * (AH + off * 2); }
+    }
+    cpos[i * 3] = x; cpos[i * 3 + 1] = y; cpos[i * 3 + 2] = z;
+    // warm/cool audience mix (phone screens + house lights)
+    const warm = Math.random() < 0.5, br = 0.35 + Math.random() * 0.55;
+    ccol[i * 3] = br * (warm ? 1.0 : 0.72);
+    ccol[i * 3 + 1] = br * 0.85;
+    ccol[i * 3 + 2] = br * (warm ? 0.62 : 1.0);
   }
   const cgeo = new T.BufferGeometry(); cgeo.setAttribute("position", new T.BufferAttribute(cpos, 3)); cgeo.setAttribute("color", new T.BufferAttribute(ccol, 3));
-  const crowd = new T.Points(cgeo, new T.PointsMaterial({ size: 6, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false }));
+  const crowd = new T.Points(cgeo, new T.PointsMaterial({ size: 10, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false }));
   crowd.frustumCulled = false; arenaGroup.add(crowd); envAnim.crowd = crowd;
 
   // jumbotron screens (corners, angled inward) + a big backdrop sign; the
   // Blender colosseum's stands are deeper/taller, so screens move out and up.
   // ry aims each plane's +Z normal INTO the arena (they faced outward before,
   // showing the arena camera their mirrored backs).
+  jumboFeedScreen = null; jumboFeedFrame = null;   // arena is rebuilt per match
   const jOff = glbArenaActive ? 340 : 80, jY = glbArenaActive ? 330 : 230;
   const screens = [
-    { x: -halfW - jOff, z: -halfH - jOff, ry: Math.PI * 0.25, w: 360, h: 180, y: jY },
-    { x: halfW + jOff, z: -halfH - jOff, ry: -Math.PI * 0.25, w: 360, h: 180, y: jY },
-    { x: 0, z: -halfH - (glbArenaActive ? 460 : 260), ry: 0, w: 900, h: 300, y: glbArenaActive ? 420 : 320 },
+    { x: -halfW - jOff, z: -halfH - jOff, ry: Math.PI * 0.25, w: 360, h: 180, y: jY, brand: true },
+    { x: halfW + jOff, z: -halfH - jOff, ry: -Math.PI * 0.25, w: 360, h: 180, y: jY, brand: true },
+    // the live jumbotron: mirrors the completed broadcast frame
+    { x: 0, z: -halfH - (glbArenaActive ? 460 : 260), ry: 0, w: 900, h: 300, y: glbArenaActive ? 420 : 320, feed: true },
   ];
   screens.forEach((s) => {
-    const m = jumboScreen(s.w, s.h);
+    const m = jumboScreen(s.w, s.h, { feed: s.feed, brand: s.brand });
     m.position.set(s.x, s.y, s.z); m.rotation.y = s.ry; arenaGroup.add(m);
     const frame = new T.Mesh(new T.BoxGeometry(s.w + 16, s.h + 16, 8),
       new T.MeshStandardMaterial({ color: 0x10141c, roughness: 0.6, metalness: 0.7, emissive: 0x3fd0c9, emissiveIntensity: 0.3 }));
     frame.position.set(s.x, s.y, s.z); frame.rotation.y = s.ry;
     frame.position.add(new T.Vector3(-Math.sin(s.ry) * 6, 0, -Math.cos(s.ry) * 6));   // frame sits behind the screen
+    if (s.feed) jumboFeedFrame = frame;
     arenaGroup.add(frame); envAnim.jumbos.push(frame.material);
   });
 
@@ -479,6 +1093,7 @@ function animateEnvironment(t) {
   const pulse = 0.25 + 0.25 * (0.5 + 0.5 * Math.sin(t * 0.003));
   envAnim.jumbos.forEach((m) => m.emissiveIntensity = pulse);
   if (envAnim.crowd) envAnim.crowd.material.opacity = 0.7 + 0.25 * Math.sin(t * 0.01);
+  if (envAnim.people) envAnim.people.uniforms.u_time.value = t * 0.001;
 }
 
 // ----- static arena (floor, perimeter) -------------------------------------
@@ -589,7 +1204,7 @@ const COLLAPSE_FRAG = HAZ_NOISE + `
     col += vec3(2.2, 1.0, 0.25) * heat * heat * (0.85 + 0.3*sin(u_time*5.0 + n*9.0));
     float line = 1.0 - smoothstep(0.0, 0.06, abs(d + chew));
     col += vec3(3.2, 2.3, 1.1) * line;           // the melt line itself
-    gl_FragColor = vec4(col, a);
+    gl_FragColor = vec4(col, a * 0.6);           // ~40% lighter — keep robots/HUD readable through the melt
     #include <tonemapping_fragment>
     #include <encodings_fragment>
   }`;
@@ -656,7 +1271,7 @@ function updateCollapse(cw) {
     sdAnnounced = true;
     stinger("SUDDEN DEATH");
     ticker("☠ SUDDEN DEATH — the floor is closing in");
-    playClip("final_blow", "Sudden death! The floor is closing in!", { flush: true });
+    playClip(["sudden_death", "final_blow"], "Sudden death! The floor is closing in!", { flush: true });
     screenFlash(0.35); shake(10);
   }
 }
@@ -710,6 +1325,11 @@ function buildArena(walls, hazards) {
   lavaFX = []; shaderFX = []; hazardZones = []; lavaLights = []; flipperFX = []; turntableFX = [];
   collapseFX = null; sdAnnounced = false;   // ring was disposed with the old group
 
+  // fit the key light's shadow frustum to this arena so the 1024 map stays sharp
+  sc.left = -(AW / 2 + 220); sc.right = AW / 2 + 220;
+  sc.top = AH / 2 + 200; sc.bottom = -(AH / 2 + 200);
+  key.shadow.camera.updateProjectionMatrix();
+
   // Blender-built arena for the 5 map presets (fingerprint-matched to the
   // recorded wall layout); custom maps keep the procedural pit below.
   const arenaTpl = ARENA_TPL[wallsKey(AW, AH, walls)];
@@ -722,14 +1342,30 @@ function buildArena(walls, hazards) {
       // floor-level surfaces catch shadows; verticals only cast (self-shadow acne)
       if (/Floor|Hazard|Pads|Markings/.test(n)) o.receiveShadow = true;
       if (/Walls|Kerbs|Pylons/.test(n)) o.castShadow = true;
+      // The modelled arena ships its own textures, which never went through
+      // sharpTexture — unfiltered, they alias into crawling stair-steps on
+      // every raked surface at distance. Filter every map the model carries.
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach((mat) => {
+        if (!mat) return;
+        ["map", "normalMap", "roughnessMap", "metalnessMap", "emissiveMap", "aoMap"]
+          .forEach((slot) => { if (mat[slot]) sharpTexture(mat[slot], slot === "map"); });
+      });
+      // darken the modelled floor to match the graded procedural pit
+      if (/Floor/.test(n) && o.material && o.material.color) {
+        o.material = o.material.clone();
+        o.material.color.multiplyScalar(0.8);
+        o.material.envMapIntensity = 0.4;
+      }
     });
     model.scale.setScalar(MODEL_SCALE);
     arenaGroup.add(model);
   } else {
+    // (procedural pit — the modelled colosseum brings its own floor and kerbs)
     const ftex = floorTexture(); ftex.repeat.set(1, 1);   // painted markings map once across the pit
     const floor = new T.Mesh(
       new T.PlaneGeometry(AW, AH),
-      new T.MeshStandardMaterial({ map: ftex, roughness: 0.82, metalness: 0.15, color: 0xdfe4ec }));
+      new T.MeshStandardMaterial({ map: ftex, roughness: 0.82, metalness: 0.15, color: 0xaab2c0 }));
     floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true;
     arenaGroup.add(floor);
 
@@ -771,8 +1407,20 @@ function buildArena(walls, hazards) {
     hazardZones.push({ type: hz.type, cx, cz, w: hz.w, h: hz.h });
     const geo = new T.PlaneGeometry(hz.w, hz.h);
     const mkEdge = (col, op, y) => {
-      const e = new T.LineSegments(new T.EdgesGeometry(new T.BoxGeometry(hz.w, 1, hz.h)),
-        new T.LineBasicMaterial({ color: col, transparent: true, opacity: op }));
+      // WebGL line primitives rasterise as hard binary steps on the arena's
+      // shallow diagonals. A thin frame made from triangles receives sceneRT's
+      // multisample coverage just like the robots and other mesh silhouettes.
+      const t = Math.min(2, hz.w / 4, hz.h / 4);
+      const mat = new T.MeshBasicMaterial({ color: col, transparent: op < 1, opacity: op, side: T.DoubleSide });
+      const e = new T.Group();
+      const strip = (w, h, x, z) => {
+        const m = new T.Mesh(new T.PlaneGeometry(w, h), mat);
+        m.rotation.x = -Math.PI / 2; m.position.set(x, 0, z); e.add(m);
+      };
+      strip(hz.w, t, 0, -(hz.h - t) / 2);
+      strip(hz.w, t, 0, (hz.h - t) / 2);
+      strip(t, hz.h - t * 2, -(hz.w - t) / 2, 0);
+      strip(t, hz.h - t * 2, (hz.w - t) / 2, 0);
       e.position.set(cx, y, cz); arenaGroup.add(e);
     };
     if (hz.type === "lava") {
@@ -848,6 +1496,12 @@ function buildArena(walls, hazards) {
       mkEdge(0xff3344, 0.5, 16);   // raised danger rim so the hole reads from afar
     }
   });
+
+  // Pitch-side advertising. Built for BOTH arenas — it used to sit inside the
+  // procedural branch, so the modelled colosseum (what the demo actually loads)
+  // never got any boards at all. The modelled bowl's kerb sits slightly further
+  // out than the procedural one, so it needs a slightly wider outset.
+  buildAdBoards(arenaGroup, AW, AH, adRing().outset, adRing().base);
 
   buildEnvironment();
 }
@@ -1055,10 +1709,27 @@ function makeRobotMeshGLB(rf, col) {
       o.material = o.material.clone();
       o.material.color.setHex(col);
       o.material.emissive.setHex(col);
-      o.material.emissiveIntensity = 0.08;
+      o.material.emissiveIntensity = 0.28;
       bodyMat = o.material;
     }
   });
+  // team-tint the second-largest material too so bots stop being monochrome
+  // gray at distance (body_* is the largest; pick the biggest of the rest)
+  const matSize = new Map();
+  model.traverse((o) => {
+    if (!o.isMesh || !o.material || !o.material.color) return;
+    if ((o.material.name || "").startsWith("body_")) return;
+    const nv = o.geometry && o.geometry.attributes.position ? o.geometry.attributes.position.count : 0;
+    matSize.set(o.material, (matSize.get(o.material) || 0) + nv);
+  });
+  let second = null, secondN = 0;
+  matSize.forEach((nv, m) => { if (nv > secondN) { secondN = nv; second = m; } });
+  if (second) {
+    const tinted = second.clone();
+    tinted.color.lerp(new T.Color(col), 0.55);
+    if (tinted.emissive) { tinted.emissive.setHex(col); tinted.emissiveIntensity = 0.1; }
+    model.traverse((o) => { if (o.isMesh && o.material === second) o.material = tinted; });
+  }
   // turret pivot: gun + muzzle effects yaw together to track the aim target
   const pivot = new T.Group();
   const turretNodes = [];
@@ -1119,31 +1790,57 @@ function makeRobotMeshGLB(rf, col) {
   return grp;
 }
 
-// HP bar + name on one billboard sprite (canvas texture, redrawn on change)
+// HP bar + name on one billboard sprite (canvas texture, redrawn on change).
+// 512x160: readable from the stands; applyFrame keeps it screen-constant.
+// Label geometry. LABEL_WORLD_H is world height per unit of camera distance —
+// the trick that keeps a tag the same size on screen wherever the machine is —
+// and LABEL_ASPECT matches the 512x160 canvas. The declutter pass below sizes
+// its overlap test from these two, so a tag's real footprint and the footprint
+// used to space tags apart cannot drift.
+const LABEL_WORLD_H = 0.085, LABEL_ASPECT = 3.2;
+// Below this many tags on screen there is nothing to declutter, and hiding one
+// of two names in a bracket match would read as a bug rather than a tidy-up.
+const LABEL_DECLUTTER_FROM = 8;
+// Hysteresis band for the same pass: a tag already on screen keeps its place
+// until the clash is this much tighter than the plain threshold, and one trying
+// to claim a place needs this much more clearance than the plain threshold.
+const LABEL_HOLD = 0.8, LABEL_CLAIM = 1.2;
+// ...and how long a tag holds a state change before it may change again.
+const LABEL_SETTLE_MS = 250;
 function makeLabel() {
-  const c = document.createElement("canvas"); c.width = 256; c.height = 80;
+  const c = document.createElement("canvas"); c.width = 512; c.height = 160;
   const tex = new T.CanvasTexture(c); tex.colorSpace = T.SRGBColorSpace;
   const mat = new T.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
   const sp = new T.Sprite(mat); sp.renderOrder = 10;
   sp.userData = { canvas: c, tex, last: "" };
   return sp;
 }
+// How long a dead machine's name tag survives it, in SECONDS OF PLAYBACK — the
+// countdown is measured against the playhead, not the wall clock, so a paused
+// or scrubbed timeline holds the tag instead of quietly dropping it while the
+// operator is looking at a frozen frame.
+const OUT_TAG_S = 2.5;
 function drawLabel(sp, name, frac, alive, col) {
   const key = `${name}|${(frac * 50) | 0}|${alive}`;
   if (sp.userData.last === key) return;
   sp.userData.last = key;
   const c = sp.userData.canvas, g = c.getContext("2d");
-  g.clearRect(0, 0, 256, 80);
-  // name
-  g.font = "bold 26px ui-sans-serif, sans-serif"; g.textAlign = "center";
-  g.fillStyle = "rgba(0,0,0,0.6)"; g.fillText(alive ? name : name + " — OUT", 129, 31);
-  g.fillStyle = "#" + col.toString(16).padStart(6, "0"); g.fillText(alive ? name : name + " — OUT", 128, 30);
-  // hp bar
-  const bw = 200, bx = 28, by = 48, bh = 16;
-  g.fillStyle = "rgba(0,0,0,0.65)"; g.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
-  g.fillStyle = frac > 0.5 ? "#6bcb77" : frac > 0.25 ? "#ffd93d" : "#ff6b6b";
-  g.fillRect(bx, by, bw * Math.max(0, frac), bh);
-  g.strokeStyle = "rgba(255,255,255,0.25)"; g.lineWidth = 1; g.strokeRect(bx, by, bw, bh);
+  const colS = "#" + col.toString(16).padStart(6, "0");
+  g.clearRect(0, 0, 512, 160);
+  // team-colored plate behind the name
+  g.fillStyle = "rgba(5,7,13,0.78)"; g.fillRect(12, 6, 488, 88);
+  g.globalAlpha = 0.26; g.fillStyle = colS; g.fillRect(12, 6, 488, 88); g.globalAlpha = 1;
+  g.strokeStyle = colS; g.lineWidth = 3; g.strokeRect(12, 6, 488, 88);
+  // name: heavy weight, team color, black stroke
+  const nm = alive ? name : name + " — OUT";
+  g.font = "900 56px ui-sans-serif, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+  g.lineWidth = 8; g.strokeStyle = "rgba(0,0,0,0.95)"; g.strokeText(nm, 256, 52);
+  g.fillStyle = colS; g.fillText(nm, 256, 52);
+  // hp bar: 28px tall, black outline, team-colored fill
+  const bw = 440, bx = 36, by = 110, bh = 28;
+  g.fillStyle = "#000"; g.fillRect(bx - 3, by - 3, bw + 6, bh + 6);
+  g.fillStyle = "#1C1C1F"; g.fillRect(bx, by, bw, bh);
+  g.fillStyle = colS; g.fillRect(bx, by, bw * Math.max(0, frac), bh);
   sp.userData.tex.needsUpdate = true;
 }
 
@@ -1159,11 +1856,11 @@ function ensureRobot(rf) {
     || makeRobotMesh(rf.shape || "tank", col, r, rf.gun || "laser", rf.eng || "standard", accent);
   // visual-only upscale (sim radius unchanged): robots read on a projector; the
   // house robot gets an extra bump so it LOOMS like the menace it is
-  mesh.scale.setScalar(rf.team === "house" ? 1.6 : 1.35);
-  const label = makeLabel(); label.position.y = r * 3.1; label.scale.set(124, 38, 1);
-  // team ground-glow ring
-  const ring = new T.Mesh(new T.RingGeometry(r * 1.2, r * 1.7, 36),
-    new T.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.55, blending: T.AdditiveBlending, side: T.DoubleSide, depthWrite: false }));
+  mesh.scale.setScalar(rf.team === "house" ? 2.0 : 1.8);
+  const label = makeLabel(); label.position.y = r * 3.6; label.scale.set(124, 38, 1);
+  // team ground-glow ring — each bot sits in a colored pool
+  const ring = new T.Mesh(new T.RingGeometry(r * 1.6, r * 2.4, 36),
+    new T.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.85, blending: T.AdditiveBlending, side: T.DoubleSide, depthWrite: false }));
   ring.rotation.x = -Math.PI / 2; ring.position.y = 1.5;
   group.add(mesh, label, ring);
   scene.add(group);
@@ -1245,13 +1942,11 @@ function ensurePickup(p) {
 }
 
 // ----- weather (global, from status.weather) -------------------------------
-const BASE_BG = BG_COL;
 function applyWeather(kind) {
   // Scene fog is gone for good; weather only drives the badge now. "fog" can
   // still arrive from old recordings and keeps its badge (range effect is
   // engine-side), but nothing hazes the view.
   const el = document.getElementById("weather");
-  scene.background = new T.Color(BASE_BG);
   if (kind === "fog") {
     if (el) { el.textContent = "🌫 FOG"; el.style.display = ""; }
   } else if (kind === "wind") {
@@ -1264,44 +1959,80 @@ function applyWeather(kind) {
 // ============================================================================
 // FX: particle system (smoke + sparks), explosion shells, flash lights, beams
 // ============================================================================
-const MAXP = 2400;
-const pPos = new Float32Array(MAXP * 3), pCol = new Float32Array(MAXP * 3), pSize = new Float32Array(MAXP);
-const parts = new Array(MAXP);
-for (let i = 0; i < MAXP; i++) parts[i] = { life: 0, max: 1, vx: 0, vy: 0, vz: 0, x: 0, y: 0, z: 0, drag: 0.9, grav: 0 };
-let pHead = 0;
-const pGeo = new T.BufferGeometry();
-pGeo.setAttribute("position", new T.BufferAttribute(pPos, 3));
-pGeo.setAttribute("color", new T.BufferAttribute(pCol, 3));
-pGeo.setAttribute("psize", new T.BufferAttribute(pSize, 1));
-const pMat = new T.PointsMaterial({ size: 22, map: SPARK_TEX, vertexColors: true, transparent: true,
-  depthWrite: false, blending: T.AdditiveBlending, sizeAttenuation: true });
-const pPoints = new T.Points(pGeo, pMat); pPoints.frustumCulled = false; scene.add(pPoints);
+// Two pools: additive shrinking SPARKS + normal-alpha SMOKE that expands and
+// darkens over its lifetime. The old single PointsMaterial never consumed the
+// per-particle psize attribute, so everything rendered as one uniform blob.
+// Local ShaderMaterials (vendored Three only): psize + normalized life drive
+// gl_PointSize and opacity.
+const PART_VERT = (sizeCurve) => `
+  attribute float psize; attribute float plife; attribute vec3 pcol;
+  varying float vLife; varying vec3 vCol;
+  void main(){
+    vLife = plife; vCol = pcol;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = psize * (${sizeCurve}) * (280.0 / -mv.z);
+    gl_Position = projectionMatrix * mv;
+  }`;
+const SPARK_FRAG = `
+  uniform sampler2D uTex; varying float vLife; varying vec3 vCol;
+  void main(){ vec4 t = texture2D(uTex, gl_PointCoord);
+    gl_FragColor = vec4(vCol * vLife, t.a * vLife); }`;
+const SMOKE_FRAG = `
+  uniform sampler2D uTex; varying float vLife; varying vec3 vCol;
+  void main(){ vec4 t = texture2D(uTex, gl_PointCoord);
+    gl_FragColor = vec4(vCol * (0.35 + 0.65 * vLife), t.a * vLife * 0.6); }`;
+function makePool(cap, sizeCurve, frag, blending) {
+  const pos = new Float32Array(cap * 3), col = new Float32Array(cap * 3);
+  const sz = new Float32Array(cap), lf = new Float32Array(cap);
+  const items = new Array(cap);
+  for (let i = 0; i < cap; i++) items[i] = { life: 0, max: 1, vx: 0, vy: 0, vz: 0,
+    x: 0, y: 0, z: 0, drag: 0.9, grav: 0, r: 0, g: 0, b: 0, size: 22 };
+  const geo = new T.BufferGeometry();
+  geo.setAttribute("position", new T.BufferAttribute(pos, 3));
+  geo.setAttribute("pcol", new T.BufferAttribute(col, 3));
+  geo.setAttribute("psize", new T.BufferAttribute(sz, 1));
+  geo.setAttribute("plife", new T.BufferAttribute(lf, 1));
+  const mat = new T.ShaderMaterial({ uniforms: { uTex: { value: SPARK_TEX } },
+    vertexShader: PART_VERT(sizeCurve), fragmentShader: frag,
+    transparent: true, depthWrite: false, blending });
+  const points = new T.Points(geo, mat);
+  points.frustumCulled = false; scene.add(points);
+  return { cap, items, pos, col, sz, lf, geo, head: 0 };
+}
+const SPARKS = makePool(1600, "0.35 + 0.65 * plife", SPARK_FRAG, T.AdditiveBlending);  // shrink as they die
+const SMOKE = makePool(1000, "1.6 - 0.8 * plife", SMOKE_FRAG, T.NormalBlending);       // expand + darken
 
-function spawnParticle(x, y, z, vx, vy, vz, life, r, g, b, drag, grav) {
-  const p = parts[pHead]; pHead = (pHead + 1) % MAXP;
+// size: optional birth size in world units (default 22; pass 2-3x for impacts).
+// Dark particles route to the smoke pool, bright ones to the additive sparks.
+function spawnParticle(x, y, z, vx, vy, vz, life, r, g, b, drag, grav, size) {
+  const P = (r + g + b) < 1.05 ? SMOKE : SPARKS;
+  const p = P.items[P.head]; P.head = (P.head + 1) % P.cap;
   p.x = x; p.y = y; p.z = z; p.vx = vx; p.vy = vy; p.vz = vz;
   p.life = life; p.max = life; p.drag = drag; p.grav = grav;
-  p.r = r; p.g = g; p.b = b;
+  p.r = r; p.g = g; p.b = b; p.size = size || 22;
 }
-function updateParticles(dt) {
-  for (let i = 0; i < MAXP; i++) {
-    const p = parts[i]; const o = i * 3;
+function updatePool(P, dt) {
+  for (let i = 0; i < P.cap; i++) {
+    const p = P.items[i]; const o = i * 3;
     if (p.life > 0) {
       p.life -= dt;
       p.vy -= p.grav * dt;
       p.vx *= p.drag; p.vy *= p.drag; p.vz *= p.drag;
       p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
       const f = Math.max(0, p.life / p.max);
-      pPos[o] = p.x; pPos[o + 1] = p.y; pPos[o + 2] = p.z;
-      pCol[o] = p.r * f; pCol[o + 1] = p.g * f; pCol[o + 2] = p.b * f;
-      pSize[o] = f;
+      P.pos[o] = p.x; P.pos[o + 1] = p.y; P.pos[o + 2] = p.z;
+      P.col[o] = p.r; P.col[o + 1] = p.g; P.col[o + 2] = p.b;
+      P.sz[i] = p.size; P.lf[i] = f;
     } else {
-      pPos[o + 1] = -99999; pCol[o] = pCol[o + 1] = pCol[o + 2] = 0;
+      P.pos[o + 1] = -99999; P.lf[i] = 0;
     }
   }
-  pGeo.attributes.position.needsUpdate = true;
-  pGeo.attributes.color.needsUpdate = true;
+  P.geo.attributes.position.needsUpdate = true;
+  P.geo.attributes.pcol.needsUpdate = true;
+  P.geo.attributes.psize.needsUpdate = true;
+  P.geo.attributes.plife.needsUpdate = true;
 }
+function updateParticles(dt) { updatePool(SPARKS, dt); updatePool(SMOKE, dt); }
 
 // floating damage numbers: world-space sprites that pop, rise and fade.
 // Size + colour scale with the hit; repairs float up green.
@@ -1320,7 +2051,9 @@ function damageNumber(wx, wz, y, amount, heal) {
   const tex = new T.CanvasTexture(c);
   const sp = new T.Sprite(new T.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
   sp.renderOrder = 11;
-  const s = big ? 116 : mid ? 90 : 66;
+  // distance-scaled so big hits hold ~40px screen height at any zoom
+  const camDist = camera.position.distanceTo(new T.Vector3(wx, y, wz));
+  const s = (big ? 116 : mid ? 90 : 66) * Math.max(1, camDist / 900);
   sp.scale.set(s, s / 2, 1);
   sp.position.set(wx + (Math.random() - 0.5) * 22, y, wz + (Math.random() - 0.5) * 10);
   scene.add(sp);
@@ -1347,7 +2080,7 @@ const shockwaves = [];
 const debris = [];
 const scorches = [];
 function spawnDebris(wx, wz, col, r) {
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < 18; i++) {
     const m = new T.Mesh(new T.BoxGeometry(r * 0.3, r * 0.3, r * 0.3),
       new T.MeshStandardMaterial({ color: col, roughness: 0.5, metalness: 0.6, emissive: col, emissiveIntensity: 0.2 }));
     m.position.set(wx, r * 0.6, wz); m.castShadow = true; scene.add(m);
@@ -1361,14 +2094,26 @@ function scorchDecal(wx, wz, rad) {
   const m = new T.Mesh(new T.CircleGeometry(rad, 24),
     new T.MeshBasicMaterial({ color: 0x05070a, transparent: true, opacity: 0.55, depthWrite: false }));
   m.rotation.x = -Math.PI / 2; m.position.set(wx, 0.6, wz); scene.add(m);
-  scorches.push({ mesh: m, life: 6, max: 6 });
-  while (scorches.length > 22) { const s = scorches.shift(); scene.remove(s.mesh); s.mesh.geometry.dispose(); s.mesh.material.dispose(); }
+  // decals persist for the whole match (a 2-minute war marks the floor); past
+  // the cap the oldest get a 1.5s fade before eviction in updateFX
+  scorches.push({ mesh: m, life: Infinity, max: Infinity });
+  let over = scorches.length - 64;
+  for (let i = 0; i < scorches.length && over > 0; i++)
+    if (scorches[i].life === Infinity) { scorches[i].life = 1.5; over--; }
 }
 let fovPunch = 0;          // transient FOV kick on blasts
 let introT = 0;            // cinematic intro sweep timer
 let slowmoT = 0, slowmoFired = false;  // slow-mo on the deciding blow
 const lastHp = {};         // id -> hp at last tick (hit-flash detection)
+// A tick-rate DoT (sudden-death fire floor) fires a floating number every
+// simulation tick (18-90/sec); each lives 1.8s on screen, so without a
+// wall-clock floor between spawns they permanently overlap into a pile.
+// Coalesce: skip the sprite if one just fired for this bot, fold the missed
+// amount into the next one so no damage total is lost, only its granularity.
+const lastDmgAt = {}, dmgPending = {};
+const DMG_COALESCE_MS = 90;
 let endFired = false;      // one-shot guard so RW.onMatchEnd fires once per match
+let celebrate = null, bannerTimer = null;   // victory hero shot + delayed banner reveal
 const lbEl = document.getElementById("letterbox");
 function setLetterbox(on) { if (lbEl) lbEl.classList.toggle("show", on); }
 const FLASHES = [];
@@ -1380,11 +2125,11 @@ function flash(x, y, z, color, power) {
   f.light.position.set(x, y, z); f.light.color.setHex(color);
   f.life = 0.45; f.max = 0.45; f.power = power; f.light.intensity = power;
 }
-function explode(x, z, blastR) {
+function explode(x, z, blastR, col) {
   const wx = x - AW / 2, wz = z - AH / 2;
   // expanding shell
   const shell = new T.Mesh(new T.SphereGeometry(1, 18, 14),
-    new T.MeshBasicMaterial({ color: 0xffdd88, transparent: true, opacity: 0.85, blending: T.AdditiveBlending, depthWrite: false }));
+    new T.MeshBasicMaterial({ color: col || 0xffdd88, transparent: true, opacity: 0.85, blending: T.AdditiveBlending, depthWrite: false }));
   shell.position.set(wx, blastR * 0.4, wz); scene.add(shell);
   shells.push({ mesh: shell, life: 0.5, max: 0.5, target: blastR });
   // fire + sparks
@@ -1403,21 +2148,20 @@ function explode(x, z, blastR) {
       (Math.random() - 0.5) * 30, 20 + Math.random() * 40, (Math.random() - 0.5) * 30, 1.1, 0.22, 0.2, 0.2, 0.93, 30);
   // flat ground shockwave ring
   const sw = new T.Mesh(new T.RingGeometry(1, 1.25, 48),
-    new T.MeshBasicMaterial({ color: 0xffd488, transparent: true, opacity: 0.8, side: T.DoubleSide, blending: T.AdditiveBlending, depthWrite: false }));
+    new T.MeshBasicMaterial({ color: col || 0xffd488, transparent: true, opacity: 0.8, side: T.DoubleSide, blending: T.AdditiveBlending, depthWrite: false }));
   sw.rotation.x = -Math.PI / 2; sw.position.set(wx, 3, wz); scene.add(sw);
   shockwaves.push({ mesh: sw, life: 0.55, max: 0.55, target: blastR * 2.2 });
-  flash(wx, blastR * 0.6, wz, 0xffbb55, Math.min(6, 2 + blastR / 30));
+  flash(wx, blastR * 0.6, wz, col || 0xffbb55, Math.min(6, 2 + blastR / 30));
   shake(Math.min(26, blastR * 0.22));
   fovPunch = Math.min(6, fovPunch + blastR * 0.05);
   scorchDecal(wx, wz, blastR * 0.7);
   if (blastR >= 70) screenFlash(0.5);
 }
+// Loop-driven white flash (no nested rAF: a stalled frame used to strand a
+// white veil over everything). Alpha clamped so blasts never bleach the frame.
 const flashEl = document.getElementById("flash");
-function screenFlash(a) {
-  if (!flashEl) return;
-  flashEl.style.transition = "none"; flashEl.style.opacity = a;
-  requestAnimationFrame(() => { flashEl.style.transition = "opacity .3s"; flashEl.style.opacity = 0; });
-}
+let flashT = 0;
+function screenFlash(a) { flashT = Math.max(flashT, Math.min(a, 0.3)); }
 
 // gun tracers (pooled). One geometry, per-shot scale: laser = thin needle,
 // cannon = fat white-hot slug, shotgun = a 3-beam fan.
@@ -1437,79 +2181,218 @@ function beamOne(a, c, col, thick, life) {
   b.mesh.material.color.setHex(col);
   b.life = life; b.max = life;
 }
+// cannon slug: a glowing sprite that travels muzzle -> impact over ~80ms (same
+// pattern as the rocket objects); the heavy burst lands when it arrives
+const slugs = [];
+function fireSlug(a, c, thickMul) {
+  const sp = new T.Sprite(new T.SpriteMaterial({ map: SPARK_TEX, color: 0xfff2dd,
+    blending: T.AdditiveBlending, transparent: true, depthWrite: false }));
+  sp.scale.set(30 * Math.max(1, thickMul), 30 * Math.max(1, thickMul), 1);
+  sp.position.copy(a); scene.add(sp);
+  slugs.push({ sp, from: a.clone(), to: c.clone(), t: 0, dur: 0.08 });
+}
 function beam(ax, az, bx, bz, col, gun, miss) {
   const a = new T.Vector3(ax - AW / 2, 24, az - AH / 2);
   const c = new T.Vector3(bx - AW / 2, 24, bz - AH / 2);
+  // tracers hold 2-3px at any zoom: thickness scales with camera distance
+  const thickMul = camera.position.distanceTo(c) / 900;
   if (miss) {
     // the shot sails PAST — a dimmer tracer with no impact FX. The crowd groans.
-    beamOne(a, c, col, gun === "cannon" ? 3.2 : 1.1, 0.12);
+    beamOne(a, c, col, (gun === "cannon" ? 3.2 : 1.1) * thickMul, 0.25);
     return;
   }
   if (gun === "cannon") {
-    beamOne(a, c, 0xfff2dd, 4.5, 0.22);           // white-hot slug trace
-    for (let i = 0; i < 22; i++)                   // heavy impact burst
-      spawnParticle(c.x, c.y, c.z, (Math.random() - 0.5) * 260, Math.random() * 200, (Math.random() - 0.5) * 260,
-        0.35, 1, 0.8, 0.4, 0.85, 260);
-    flash(c.x, 40, c.z, 0xffcc88, 2.5);
-    shake(6);
+    fireSlug(a, c, thickMul);                      // burst lands on arrival (updateFX)
+    for (let i = 0; i < 6; i++)                    // muzzle smoke
+      spawnParticle(a.x, a.y, a.z, (Math.random() - 0.5) * 40, 20 + Math.random() * 30, (Math.random() - 0.5) * 40,
+        0.5, 0.3, 0.3, 0.3, 0.9, 20, 30);
   } else if (gun === "shotgun") {
-    // fan: centre beam on the target + two spread pellets from the shooter
-    const dir = c.clone().sub(a), len = dir.length();
-    beamOne(a, c, col, 1.2, 0.14);
-    [-0.22, 0.22].forEach((off) => {
+    // 5-tracer cone + a muzzle smoke puff
+    const dir = c.clone().sub(a);
+    beamOne(a, c, col, 1.2 * thickMul, 0.14);
+    [-0.3, -0.15, 0.15, 0.3].forEach((off) => {
       const spread = dir.clone().applyAxisAngle(new T.Vector3(0, 1, 0), off).multiplyScalar(0.82);
-      beamOne(a, a.clone().add(spread), col, 1.2, 0.14);
+      beamOne(a, a.clone().add(spread), col, 1.2 * thickMul, 0.14);
     });
+    for (let i = 0; i < 5; i++)
+      spawnParticle(a.x, a.y, a.z, (Math.random() - 0.5) * 30, 15 + Math.random() * 25, (Math.random() - 0.5) * 30,
+        0.45, 0.28, 0.28, 0.28, 0.9, 15, 26);
     for (let i = 0; i < 12; i++)
       spawnParticle(c.x, c.y, c.z, (Math.random() - 0.5) * 200, Math.random() * 130, (Math.random() - 0.5) * 200,
-        0.22, 1, 0.85, 0.45, 0.85, 210);
-  } else {   // laser
-    beamOne(a, c, col, 1.6, 0.16);
+        0.22, 1, 0.85, 0.45, 0.85, 210, 44);
+  } else {   // laser: white-hot core inside a team-color glow shell
+    beamOne(a, c, 0xffffff, 0.7 * thickMul, 0.3);
+    beamOne(a, c, col, 2.2 * thickMul, 0.3);
     for (let i = 0; i < 10; i++)
       spawnParticle(c.x, c.y, c.z, (Math.random() - 0.5) * 160, Math.random() * 120, (Math.random() - 0.5) * 160,
-        0.25, 1, 0.9, 0.5, 0.85, 200);
+        0.25, 1, 0.9, 0.5, 0.85, 200, 40);
   }
 }
 
 // ----- camera: auto-follow + screen shake + manual orbit override -----------
-const BASE_FOV = 52, INTRO_MAX = 2.8;
+const BASE_FOV = 48, INTRO_MAX = 2.8;
 const cam = {
   tgt: new T.Vector3(0, 0, 0), pos: new T.Vector3(0, 1400, 1400),
   desiredTgt: new T.Vector3(), desiredPos: new T.Vector3(),
-  shakeAmt: 0, auto: true, az: 0.7, el: 0.62, distMul: 1.0, dragging: false, px: 0, py: 0,
+  shakeAmt: 0, auto: true, az: 0.7, el: 0.50, distMul: 1.0, dragging: false, px: 0, py: 0,
   focus: null,
+  // auto-director state machine: OVERVIEW | ACTION | FINAL_BLOW | VICTORY | MANUAL
+  state: "OVERVIEW", override: false, overrideUntil: 0, manualTgt: null, manualBaseDist: 900,
+  clusterId: null, clusterHold: 0,   // free-for-all shot selection, see pickCluster
 };
 function shake(a) { cam.shakeAmt = Math.min(40, cam.shakeAmt + a); }
+
+// Free-for-all cluster framing. The 41-entrant format puts the whole field on
+// the floor at once, and framing the centroid of everything alive pins the
+// camera at its far clamp for the entire match: forty dots, no fight to watch.
+// Pick the densest knot of machines instead and frame only that.
+//
+// Density, not damage: the kill-cam and proximity focus below already own the
+// individual moments, and a shot that chases every hit is unwatchable.
+//
+// The CHOICE is deterministic — no randomness, and ties break on the lower
+// robot id, so the same field of machines always picks the same shot. The
+// TIMING is not: the dwell counts down on wall-clock dt like every other
+// camera easing here, so two playbacks at different frame rates can cut at
+// slightly different moments. That is the existing behaviour of this camera
+// and is separate from the engine's byte-identical replay guarantee, which
+// covers the simulation and not the framing of it.
+const CLUSTER_MIN = 3;        // fewer machines than this is not a scrum, read wide
+const CLUSTER_DWELL = 2.5;    // seconds a chosen shot is held before reconsidering
+function clusterRadius() { return Math.min(AW, AH) * 0.34; }   // "in the same fight"
+function membersOf(pts, seed, r) {
+  return pts.filter((p) => Math.hypot(p.x - seed.x, p.z - seed.z) <= r);
+}
+// the scan below only needs the count — allocating an array per candidate per
+// frame is pure garbage in the render loop
+function countNear(pts, seed, r) {
+  let c = 0;
+  for (const p of pts) if (Math.hypot(p.x - seed.x, p.z - seed.z) <= r) c++;
+  return c;
+}
+function pickCluster(pts, dt) {
+  const r = clusterRadius();
+  cam.clusterHold -= dt;
+  // hold the current shot while it is still a scrum and the dwell has not run
+  // out — without this the camera ping-pongs between skirmishes every frame
+  if (cam.clusterId != null) {
+    const seed = pts.find((p) => p.id === cam.clusterId);
+    const held = seed ? membersOf(pts, seed, r) : [];
+    if (held.length >= CLUSTER_MIN && cam.clusterHold > 0) return held;
+  }
+  let best = null, bestN = 0;
+  for (const p of pts) {
+    const c = countNear(pts, p, r);
+    if (c > bestN || (c === bestN && best && p.id < best.id)) { best = p; bestN = c; }
+  }
+  if (bestN < CLUSTER_MIN) { cam.clusterId = null; return pts; }   // nothing knotted up
+  cam.clusterId = best.id; cam.clusterHold = CLUSTER_DWELL;
+  return membersOf(pts, best, r);
+}
+// Auto-director state machine. Every frame resolves to exactly one owner of the
+// camera and records it on cam.state:
+//   VICTORY    — exclusive winner hero shot (bypasses centroid framing)
+//   MANUAL     — operator control: auto off, or a live drag-override
+//   FINAL_BLOW — kill-cam slow-mo punch-in on the deciding blow
+//   ACTION     — tight tracking of a close engagement
+//   OVERVIEW   — wide read (pre-fight, or robots far apart)
+// State is chosen deterministically from playback signals; the only randomness
+// in this path is the cosmetic screen-shake jitter in the shared tail below.
 function updateCamera(dt, alivePts) {
-  // frame the action: centroid + spread of alive robots
-  let cx = 0, cz = 0, n = 0, spread = 300;
-  alivePts.forEach((p) => { cx += p.x; cz += p.z; n++; });
-  if (n) {
-    cx /= n; cz /= n; let m = 0;
-    alivePts.forEach((p) => { m = Math.max(m, Math.hypot(p.x - cx, p.z - cz)); });
-    spread = Math.max(300, m + 220);
+  // expire a temporary drag-override back to the armed auto states
+  if (cam.override && performance.now() >= cam.overrideUntil) { cam.override = false; syncCamBtn(); }
+  const manual = !cam.auto || cam.override;
+  let k;
+
+  if (celebrate && cam.auto) {
+    // VICTORY — frame the WINNER robot directly (not the survivor centroid).
+    // The main loop's celebrate block drives the slow orbital drift (cam.az)
+    // and the winner's ring/emissive pump; here we just own the framing.
+    cam.state = "VICTORY";
+    const wo = robotObjs[celebrate.id];
+    const wx = wo ? wo.group.position.x : cam.tgt.x, wz = wo ? wo.group.position.z : cam.tgt.z;
+    const vel = Math.max(0.30, cam.el * 0.82);         // slightly lower — heroic angle
+    const vdist = Math.max(260, 360 * cam.distMul);    // ~0.5x the normal framing clamp
+    const vhor = Math.cos(vel) * vdist;
+    cam.desiredTgt.set(wx, 44, wz);
+    cam.desiredPos.set(wx + Math.cos(cam.az) * vhor, Math.sin(vel) * vdist + 64, wz + Math.sin(cam.az) * vhor);
+    cam.manualTgt = null;
+    k = 1 - Math.pow(0.03, dt);
+  } else if (manual) {
+    // MANUAL — hold the operator's target, orbit (az/el) and zoom (distMul);
+    // never recompute the centroid/framing. Freeze the target + base distance
+    // at hand-off so auto framing stops fighting the drag.
+    cam.state = "MANUAL";
+    if (!cam.manualTgt) {
+      cam.manualTgt = cam.desiredTgt.clone();
+      cam.manualBaseDist = cam.pos.distanceTo(cam.tgt) / (cam.distMul || 1);
+    }
+    const tg = cam.manualTgt, mdist = cam.manualBaseDist * cam.distMul, mhor = Math.cos(cam.el) * mdist;
+    cam.desiredTgt.copy(tg);
+    cam.desiredPos.set(tg.x + Math.cos(cam.az) * mhor, Math.sin(cam.el) * mdist + 60, tg.z + Math.sin(cam.az) * mhor);
+    k = 1 - Math.pow(0.02, dt);
+  } else {
+    cam.manualTgt = null;
+    // ---- automatic framing (OVERVIEW / ACTION / FINAL_BLOW) ----
+    // frame the action: centroid + spread of alive robots (tight base framing —
+    // fill the frame with the fight)
+    let cx = 0, cz = 0, spread = 300, maxR = 0;
+    const n = alivePts.length;
+    // Frame the chosen cluster, not the whole field. `n` stays the true alive
+    // count below — the 1v1 tuning and the OVERVIEW/ACTION test both key off it.
+    const framed = n > 2 ? pickCluster(alivePts, dt) : alivePts;
+    framed.forEach((p) => { cx += p.x; cz += p.z; });
+    if (framed.length) {
+      cx /= framed.length; cz /= framed.length;
+      framed.forEach((p) => { maxR = Math.max(maxR, Math.hypot(p.x - cx, p.z - cz)); });
+      spread = Math.max(n <= 2 ? 220 : 300, maxR + 120);
+    }
+    // proximity action-cam: the last two machines closing to brawl range earn a
+    // punch-in on their midpoint (kill-cam focus values are owned elsewhere)
+    if (n === 2 && (!cam.focus || cam.focus.life <= 0 || cam.focus.prox)) {
+      const pdx = alivePts[0].x - alivePts[1].x, pdz = alivePts[0].z - alivePts[1].z;
+      if (Math.hypot(pdx, pdz) < 400)
+        cam.focus = { x: (alivePts[0].x + alivePts[1].x) / 2, z: (alivePts[0].z + alivePts[1].z) / 2,
+                      life: 2.5, max: 2.5, zoom: 0.75, prox: true };
+    }
+    // focus (kill-cam or proximity): bias toward the moment + punch in
+    let focusZoom = 1, focused = false, killFocus = false;
+    if (cam.focus && cam.focus.life > 0) {
+      cam.focus.life -= dt;
+      focused = true; killFocus = !cam.focus.prox;    // non-proximity focus == kill-cam
+      const ff = cam.focus.life / cam.focus.max;       // 1 -> 0
+      const bias = cam.focus.bias != null ? cam.focus.bias : 0.55;
+      const zoom = cam.focus.zoom != null ? cam.focus.zoom : 0.6;
+      cx += (cam.focus.x - cx) * bias * ff; cz += (cam.focus.z - cz) * bias * ff;
+      focusZoom = 1 - (1 - zoom) * ff;
+    }
+    // classify OVERVIEW vs ACTION deterministically: pre-fight or robots far
+    // apart read wide; a close engagement tracks tight. FINAL_BLOW owns the
+    // kill-cam / deciding-blow slow-mo.
+    const engaged = n === 2
+      ? Math.hypot(alivePts[0].x - alivePts[1].x, alivePts[0].z - alivePts[1].z) < 520
+      : n > 2 ? maxR < 520 : n === 1;
+    cam.state = (slowmoT > 0 || killFocus) ? "FINAL_BLOW"
+              : (introT > 0 || !engaged) ? "OVERVIEW" : "ACTION";
+    // cinematic intro sweep: start LOW and CLOSE, crane up and settle
+    let azOff = 0, introZoom = 1, kBoost = 0, el = cam.el;
+    if (introT > 0) {
+      introT = Math.max(0, introT - dt);
+      const e = introT / INTRO_MAX;                    // 1 -> 0
+      azOff = e * e * 0.9; introZoom = 1 - e * 0.25; kBoost = 0.02 * e;
+      el = 0.30 + (cam.el - 0.30) * (1 - e);
+    }
+    cam.desiredTgt.set(cx, 28, cz);
+    let dist = Math.max(650, Math.min(1800, spread * 1.5)) * cam.distMul * focusZoom * introZoom;
+    if (n <= 2 && n > 0) dist *= 0.85;               // the bracket 1v1 format: tighter still
+    if (cam.state === "OVERVIEW" && !focused) dist *= 1.12;   // ease back for the wide read
+    const az = cam.az + azOff;
+    const hor = Math.cos(el) * dist;
+    cam.desiredPos.set(cx + Math.cos(az) * hor, Math.sin(el) * dist + 60, cz + Math.sin(az) * hor);
+    // raised lerp while focused so the punch-in is felt
+    k = 1 - Math.pow((focused ? 0.02 : 0.0025) + kBoost, dt);   // framerate-independent
   }
-  // kill-cam: bias toward an elimination + punch in
-  let focusZoom = 1;
-  if (cam.focus && cam.focus.life > 0) {
-    cam.focus.life -= dt;
-    const ff = cam.focus.life / cam.focus.max;       // 1 -> 0
-    cx += (cam.focus.x - cx) * 0.55 * ff; cz += (cam.focus.z - cz) * 0.55 * ff;
-    focusZoom = 1 - 0.4 * ff;
-  }
-  // cinematic intro sweep (az offset + pull-back, eases out)
-  let azOff = 0, introZoom = 1, kBoost = 0;
-  if (introT > 0) {
-    introT = Math.max(0, introT - dt);
-    const e = introT / INTRO_MAX;                    // 1 -> 0
-    azOff = e * e * 2.2; introZoom = 1 + e * 1.3; kBoost = 0.02 * e;
-  }
-  cam.desiredTgt.set(cx, 40, cz);
-  const dist = Math.min(2600, spread * 2.1) * cam.distMul * focusZoom * introZoom;
-  const az = cam.az + azOff;
-  const hor = Math.cos(cam.el) * dist;
-  cam.desiredPos.set(cx + Math.cos(az) * hor, Math.sin(cam.el) * dist + 60, cz + Math.sin(az) * hor);
-  const k = 1 - Math.pow(0.0025 + kBoost, dt);   // smooth, framerate-independent
+
   cam.tgt.lerp(cam.desiredTgt, k);
   cam.pos.lerp(cam.desiredPos, k);
   const wantFov = BASE_FOV + fovPunch;
@@ -1531,16 +2414,18 @@ function frameAt(i) { return frames[Math.max(0, Math.min(frames.length - 1, i))]
 
 // --- robot entrances: each machine drives in through the nearest gate tunnel
 // before the fight, staggered, with a name stinger — then FIGHT! ------------
-let entrance = null;   // { t } while the walk-on is running
+let entrance = null;   // { t, startedAt } while the walk-on is running
 const ENTR_STAG = 1.5, ENTR_DUR = 2.6, ENTR_CAP = 8.0;
 function startEntrance() {
-  entrance = { t: -0.3 };
+  entrance = { t: -0.3, startedAt: performance.now() };
   Object.values(robotObjs).forEach((o) => { o.announced = false; });
   play(false);
 }
 function updateEntrance(dt) {
   if (playing) { entrance = null; return; }          // pressing ▶ skips the show
-  entrance.t += dt;
+  const elapsed = (performance.now() - entrance.startedAt) / 1000;
+  entrance.t = -0.3 + elapsed;
+  if (elapsed >= ENTR_CAP) { entrance = null; play(true); return; }
   const bots = frames[0].robots.filter((r) => r.team !== "house");
   // Big rosters would take a minute to file in at the 1v1 pacing — compress
   // the stagger so the whole walk-on fits inside ENTR_CAP seconds. Small
@@ -1559,7 +2444,12 @@ function updateEntrance(dt) {
     if (pg >= 1) return;                             // parked on its spawn mark
     allDone = false;
     const e = pg <= 0 ? 0 : pg < 0.5 ? 4 * pg * pg * pg : 1 - Math.pow(-2 * pg + 2, 3) / 2; // ease-in-out drive
-    o.group.position.set(g[0] + (hx - g[0]) * e, 0, g[1] + (hz - g[1]) * e);
+    const px = g[0] + (hx - g[0]) * e, pz = g[1] + (hz - g[1]) * e;
+    o.group.position.set(px, 0, pz);
+    // The gate sits 170 outside the floor, past the colosseum's wall — driving
+    // the bot from there means it visibly crosses solid geometry. Keep it hidden
+    // until it clears the boundary so it emerges from the tunnel mouth instead.
+    o.group.visible = Math.abs(px) <= AW / 2 + 10 && Math.abs(pz) <= AH / 2 + 10;
     o.mesh.rotation.y = -Math.atan2(hz - g[1], hx - g[0]);
     if (pg > 0) {
       o.wheelRot = (o.wheelRot || 0) - dt * 8;       // wheels rolling on the way in
@@ -1568,8 +2458,11 @@ function updateEntrance(dt) {
         o.announced = true;
         // a compressed walk-on would machine-gun the name cards — keep the
         // ticker roll but save the stinger for fields with room to breathe
-        if (stag >= 0.5) stinger(teamMode ? botLabel(rf) : rf.name);
-        ticker(`🎙 ${rf.name} enters the arena`);
+        if (stag >= 0.5) stinger(botLabel(rf));
+        ticker(`🎙 ${botLabel(rf)} enters the arena`);
+        // comical walk-on roast, queued so 16 entrances read as a roll-call
+        // instead of every bot talking over the last
+        playClip(["enter_" + slug(rf.name)], null, { queue: true });
       }
     }
   });
@@ -1607,15 +2500,48 @@ function applyFrame(t) {
     }
     o.mesh.rotation.y = -p.hdg;
     const frac_hp = Math.max(0, rf.hp / rf.max_hp);
+    // damage-state callout on the way DOWN through each band (never on repair,
+    // never twice for the same band), and never for the last band before death —
+    // the elimination line owns that beat
+    if (rf.alive) {
+      const band = frac_hp > 0.75 ? 100 : frac_hp > 0.5 ? 75
+        : frac_hp > 0.4 ? 50 : frac_hp > 0.25 ? 40 : 25;
+      const prev = hpBand[rf.id];
+      if (prev === undefined) hpBand[rf.id] = band;
+      else if (band < prev) {
+        hpBand[rf.id] = band;
+        // 40 is the colour-commentary beat ("it's not looking good for X"); the
+        // rest are the plain percentage calls
+        const key = BAND_CLIP[band];
+        playClip([key + "_" + voiceKey[rf.id], key]);
+      }
+    }
     const flipped = rf.alive && (rf.flip | 0) > 0, jammed = rf.alive && (rf.jam | 0) > 0;
     const venting = rf.alive && (rf.vent | 0) > 0;
-    let nm = teamMode ? botLabel(rf) : rf.name;
+    let nm = botLabel(rf);
     if (flipped) nm += " 🙃"; else if (jammed) nm += " ⚙"; else if (venting) nm += " ♨";
     if ((rf.od | 0) > 0) nm += " ⚡"; if ((rf.sh | 0) > 0) nm += " 🛡"; if ((rf.hs | 0) > 0) nm += " 💨";
     drawLabel(o.label, nm, frac_hp, rf.alive, o.col);
+    // screen-constant label: world scale proportional to camera distance
+    const lblS = camera.position.distanceTo(o.group.position) * LABEL_WORLD_H;
+    o.label.scale.set(lblS * LABEL_ASPECT, lblS, 1);
+    // A wreck keeps its "— OUT" tag for the elimination beat, then goes quiet.
+    // The stinger and the lower third have already called the kill, and these
+    // labels are screen-constant: in a free-for-all two dozen full-size corpse
+    // tags bury the fight that is still running. Null deadAtSim means the bot
+    // is alive or mid-death-animation, both of which keep the tag up. The beat
+    // is counted in frames off the playhead (`fps` frames = one second of
+    // playback), so pausing on an elimination holds the tag there.
+    // Except once the match is won, where every tag but the winner's comes down
+    // at once. The playhead stops at the final frame, so a beat measured against
+    // it would never elapse and the loser's tag would sit on top of the hero
+    // shot for as long as the trophy is up. Test saidWinner, not celebrate:
+    // celebrate is a 4s object, and the victory card outlives it.
+    o.label.visible = rf.alive || (!celebrate && !saidWinner && (o.deadAtSim == null
+      || t - o.deadAtSim < fps * OUT_TAG_S));
     if (rf.alive) {
-      o.group.visible = true; alivePts.push({ x: wx, z: wz });
-      if (o.dead) { o.dead = false; o.mesh.rotation.z = 0; o.mesh.position.y = 0; }
+      o.group.visible = true; alivePts.push({ x: wx, z: wz, id: rf.id });
+      if (o.dead || o.dyingAt) { o.dead = false; o.dyingAt = null; o.deadAtSim = null; o.mesh.rotation.z = 0; o.mesh.position.y = 0; }
       // wheels-up: flipped bots lie on their back and wobble helplessly
       if (flipped) {
         o.mesh.rotation.z = Math.PI + 0.1 * Math.sin(performance.now() * 0.01 + rf.id);
@@ -1637,7 +2563,7 @@ function applyFrame(t) {
           (Math.random() - 0.5) * 25, 65 + Math.random() * 45, (Math.random() - 0.5) * 25,
           0.55, 0.82, 0.87, 0.92, 0.92, 15);
       o.ring.visible = true;
-      o.ring.material.opacity = 0.4 + 0.2 * Math.sin(performance.now() * 0.006 + rf.id);
+      o.ring.material.opacity = 0.72 + 0.13 * Math.sin(performance.now() * 0.006 + rf.id);
       // turret tracks nearest living enemy
       const tur = o.mesh.userData.turret;
       if (tur) {
@@ -1680,12 +2606,37 @@ function applyFrame(t) {
     } else {
       o.ring.visible = false;
       if (!o.dead) {
-        o.dead = true; o.mesh.rotation.z = 0.5; o.mesh.position.y = -6;
-        for (let k = 0; k < 14; k++)
-          spawnParticle(wx, 30, wz, (Math.random() - 0.5) * 40, 30 + Math.random() * 40, (Math.random() - 0.5) * 40,
-            0.9, 0.25, 0.25, 0.28, 0.9, 60);
-        spawnDebris(wx, wz, o.col, o.r);
-        explode(wx + AW / 2, wz + AH / 2, 60);   // death blast (arena coords)
+        // staged death: ~0.3s hull shudder + electrical sparks, THEN the blast
+        if (!o.dyingAt) o.dyingAt = performance.now();
+        const dp = (performance.now() - o.dyingAt) / 300;
+        if (dp < 1) {
+          o.mesh.position.y = Math.sin(dp * 42) * 2.2;
+          o.mesh.rotation.z = Math.sin(dp * 57) * 0.06;
+          if (Math.random() < 0.6)
+            spawnParticle(wx, o.r * 1.2, wz, (Math.random() - 0.5) * 160, 60 + Math.random() * 90,
+              (Math.random() - 0.5) * 160, 0.3, 1.0, 0.9, 0.5, 0.86, 220);
+        } else {
+          o.dead = true; o.dyingAt = null; o.deadAtSim = t;
+          o.mesh.rotation.z = 0.35; o.mesh.position.y = -2;   // resting wreck
+          for (let k = 0; k < 14; k++)
+            spawnParticle(wx, 30, wz, (Math.random() - 0.5) * 40, 30 + Math.random() * 40, (Math.random() - 0.5) * 40,
+              0.9, 0.25, 0.25, 0.28, 0.9, 60);
+          spawnDebris(wx, wz, o.col, o.r);
+          explode(wx + AW / 2, wz + AH / 2, 60);   // death blast (arena coords)
+          fovPunch = Math.min(12, fovPunch + 6);
+          screenFlash(0.35);                       // clamped to 0.3
+        }
+      } else {
+        // burning wreck: embers + smoke keep rising off the corpse
+        if (Math.random() < 0.5) {
+          const ang2 = p.hdg + 2.4;                // same broken-part anchor as battle smoke
+          spawnParticle(wx + Math.cos(ang2) * o.r * 0.7, o.r * 0.9, wz + Math.sin(ang2) * o.r * 0.7,
+            (Math.random() - 0.5) * 18, 30 + Math.random() * 55, (Math.random() - 0.5) * 18,
+            1.2, 0.07, 0.07, 0.09, 0.93, 45);
+        }
+        if (Math.random() < 0.35)
+          spawnParticle(wx, o.r * 0.7, wz, (Math.random() - 0.5) * 40, 40 + Math.random() * 70,
+            (Math.random() - 0.5) * 40, 0.7, 1.0, 0.45, 0.12, 0.94, -20);
       }
     }
     // spinning parts (alive + upright only — a flipped bot's weapon spins down)
@@ -1725,7 +2676,9 @@ function applyFrame(t) {
     // hit-flash + progressive battle damage (body darkens + scorches as HP falls)
     const bm = o.mesh.userData.bodyMat, base = o.mesh.userData.baseCol;
     if (bm) {
-      bm.emissiveIntensity = 0.12 + o.flash;
+      // true white pop for ~90ms on a hit, then back to the team-color glow
+      if (o.flash > 0) { bm.emissive.setHex(0xffffff); bm.emissiveIntensity = 1.5; }
+      else { bm.emissive.copy(base); bm.emissiveIntensity = 0.28; }
       const dmg = 1 - frac_hp;
       bm.color.copy(base).lerp(SCORCH, dmg * 0.7);
       bm.roughness = 0.45 + dmg * 0.4;
@@ -1741,6 +2694,55 @@ function applyFrame(t) {
     o.prevPos = { x: wx, z: wz };
   });
   Object.keys(robotObjs).forEach((id) => { if (!seen[id]) robotObjs[id].group.visible = false; });
+
+  // Name tags are screen-constant, so a scrum of forty machines stacks forty
+  // full-size tags into a wall nobody can read — including the two names the
+  // shot is actually about. Drop any tag that would land on one already claimed
+  // by a nearer machine: nearest wins, and the living outrank the wrecks. Only
+  // arms once the field is big enough to pile up, so a bracket match keeps every
+  // tag it has today.
+  const upLabels = [];
+  Object.keys(robotObjs).forEach((id) => {
+    const o = robotObjs[id];
+    if (o.group.visible && o.label.visible) upLabels.push(o);
+  });
+  if (upLabels.length > LABEL_DECLUTTER_FROM) {
+    // A screen-constant sprite has a constant footprint in clip space, so the
+    // spacing thresholds are computed once rather than per tag. 0.95/0.86 trim
+    // the transparent margin off the 512x160 canvas, letting tags sit shoulder
+    // to shoulder without either being dropped.
+    const tanHalf = Math.tan(camera.fov * Math.PI / 360);
+    const gapY = 0.86 * LABEL_WORLD_H / tanHalf;
+    const gapX = 0.95 * LABEL_WORLD_H * LABEL_ASPECT / (tanHalf * camera.aspect);
+    const v = new T.Vector3(), now = performance.now();
+    const cand = upLabels.map((o) => {
+      v.set(o.group.position.x, o.group.position.y + o.label.position.y, o.group.position.z);
+      const d = camera.position.distanceTo(v);
+      v.project(camera);
+      return { o, d, x: v.x, y: v.y, behind: v.z > 1 };
+    });
+    cand.sort((a, b) => (!!a.o.dead === !!b.o.dead) ? a.d - b.d : (a.o.dead ? 1 : -1));
+    const kept = [];
+    cand.forEach((c) => {
+      if (c.behind) return;
+      // Hysteresis. Machines in a scrum jostle across the overlap threshold every
+      // frame, and a bare test flickered two or three tags per frame — traded one
+      // unreadable artefact for another. A tag that is already up has to be
+      // clashed harder to lose its place than a tag that is trying to take one.
+      const m = c.o.labelShown ? LABEL_HOLD : LABEL_CLAIM;
+      let show = !kept.some((k) => Math.abs(k.x - c.x) < gapX * m
+                                && Math.abs(k.y - c.y) < gapY * m);
+      // The band alone still left a handful of tags strobing several times a
+      // second, so a tag that has just changed state holds it for a beat. What
+      // survives now reads as the pack opening and closing, not as a fault.
+      if (show !== c.o.labelShown) {
+        if (c.o.labelLockUntil > now) show = c.o.labelShown;
+        else c.o.labelLockUntil = now + LABEL_SETTLE_MS;
+      }
+      c.o.label.visible = show; c.o.labelShown = show;
+      if (show) kept.push(c);
+    });
+  }
 
   // rockets (interpolate by id)
   const nxtRk = {}; nxt.rockets.forEach((r) => nxtRk[r.id] = r);
@@ -1804,7 +2806,7 @@ function applyFrame(t) {
   // HUD + scoreboard + broadcast timer
   const s = cur.status || {};
   updateCollapse(s.collapse || 0);          // SUDDEN DEATH molten ring
-  hud.textContent = `tick ${cur.tick}   alive ${s.alive}`;
+  if (DEBUG) hud.textContent = `TICK ${String(cur.tick).padStart(4, "0")}`;
   updateScoreboard(cur.robots);
   updateTimer(s.time_left != null ? s.time_left : 0);
   return alivePts;
@@ -1813,22 +2815,62 @@ function applyFrame(t) {
 // per-tick discrete events (explosions, lasers, deaths, intro/outro voice)
 function processTickEvents(tick) {
   if (tick === lastTickSeen) return;
+  // Victims across this whole batch. The overlay shows one message at a time,
+  // so calling killFeed per victim inside a single frame paints only the last
+  // one — in a crowded free-for-all most of the field would die uncredited.
+  const elims = [];
   // advance through any skipped ticks too
   for (let tk = lastTickSeen + 1; tk <= tick; tk++) {
     const fr = frames[tk]; if (!fr) continue;
-    if (!saidGo) { saidGo = true; playClip("fight", "Fight!", { flush: true, rate: 1.1, pitch: 1.1 }); stinger("FIGHT!"); ticker("⚔ Battle commences"); }
+    if (!saidGo) {
+      saidGo = true; playClip("fight", "Fight!", { flush: true, rate: 1.1, pitch: 1.1 });
+      stinger("FIGHT!"); ticker("⚔ Battle commences");
+      // land the beat: kick + punch-in + flash, and hold the playhead until the
+      // stinger's pop keyframe so FIGHT lands before the first exchange
+      shake(12); fovPunch = Math.min(12, fovPunch + 4); screenFlash(0.18); fightHold = 0.06;
+    }
+    // engage slow-mo + kill-cam one tick EARLY: peek at the incoming frame so
+    // the deciding blow plays in slow motion, not its aftermath smoke
+    const peek = frames[tk + 1];
+    if (peek && !slowmoFired && tk > 2) {
+      const aliveNext = peek.status ? peek.status.alive : peek.robots.filter((r) => r.alive).length;
+      const victim = peek.robots.find((r) => alivePrev[r.id] && !r.alive);
+      if (victim && aliveNext <= 1) {
+        slowmoFired = true; slowmoT = 2.0; setLetterbox(true);
+        cam.focus = { x: victim.x - AW / 2, z: victim.y - AH / 2, life: 2.0, max: 2.0, bias: 0.85, zoom: 0.45 };
+        ticker("⚡ THE FINAL BLOW");
+        playClip("final_blow", "Finish him!", { flush: true });
+      }
+    }
     const pos = {}; fr.robots.forEach((r) => pos[r.id] = r);
     (fr.explosions || []).forEach((ex) => explode(ex.x, ex.y, ex.r));
     (fr.events || []).forEach((ev) => {
-      if (ev.kind === "flip" && names[ev.id] != null) ticker(`🙃 ${names[ev.id]} FLIPPED!`);
-      else if (ev.kind === "jam" && names[ev.id] != null) ticker(`⚙ ${names[ev.id]} — GUN JAMMED`);
+      if (ev.kind === "flip" && names[ev.id] != null) {
+        ticker(`🙃 ${names[ev.id]} FLIPPED!`);
+        playClip(["flip_" + voiceKey[ev.id], "flip"], `${names[ev.id]} is flipped!`);
+      }
+      else if (ev.kind === "jam" && names[ev.id] != null) {
+        ticker(`⚙ ${names[ev.id]} — GUN JAMMED`);
+        playClip(["jam_" + voiceKey[ev.id], "jam"], `${names[ev.id]}'s gun is jammed!`);
+      }
       else if (ev.kind === "vent" && names[ev.id] != null) {
         ticker(`♨ ${names[ev.id]} — OVERHEATED, venting`);
-        playClip(["overheat"], `${names[ev.id]} is overheating!`);
+        playClip(["overheat_" + voiceKey[ev.id], "overheat"], `${names[ev.id]} is overheating!`);
       }
-      else if (ev.kind === "pickup" && ev.type === "overdrive") ticker("⚡ OVERDRIVE claimed");
-      else if (ev.kind === "pickup" && ev.type === "shield") ticker("🛡 SHIELD up");
-      else if (ev.kind === "pickup" && ev.type === "haste") ticker("💨 HASTE grabbed");
+      else if (ev.kind === "pickup" && PICKUP_UI[ev.type]) {
+        ticker(PICKUP_UI[ev.type]);
+        playClip(["pickup_" + ev.type]);
+      }
+      else if (HAZARD_UI[ev.kind]) {
+        // lava/pit/water fire on EVERY tick a bot is in the zone — rate-limit
+        // or the announcer machine-guns the same line for seconds on end
+        const nowMs = performance.now();
+        if (nowMs - (hazardSaid[ev.kind] || -1e9) > 7000) {
+          hazardSaid[ev.kind] = nowMs;
+          ticker(HAZARD_UI[ev.kind]);
+          playClip(["hazard_" + ev.kind]);
+        }
+      }
       else if (ev.kind === "flipper") {
         const fx = flipperFX.find((q) => Math.abs(q.x - ev.x) < 2 && Math.abs(q.y - ev.y) < 2);
         if (fx) fx.t = 0;
@@ -1841,7 +2883,7 @@ function processTickEvents(tick) {
         const vo = robotObjs[ev.id];
         if (vo) vo.airborne = { start: performance.now() };
         ticker(`🚀 FLOOR FLIPPER — ${names[ev.id] || "a robot"} takes flight!`);
-        playClip(["flipper", "big_hit"], `${names[ev.id] || "Someone"} takes flight!`);
+        playClip(["flipper_" + voiceKey[ev.id], "flipper", "big_hit"], `${names[ev.id] || "Someone"} takes flight!`);
       }
       else if (ev.kind === "ram") {
         // CRUNCH — metal-on-metal spark burst + kick
@@ -1871,69 +2913,118 @@ function processTickEvents(tick) {
     });
     fr.robots.forEach((r) => {
       const o = robotObjs[r.id];
-      if (lastHp[r.id] != null && r.hp < lastHp[r.id] && r.alive && o) {
-        o.flash = 0.7;
-        damageNumber(r.x - AW / 2, r.y - AH / 2, o.r * 2.6, Math.round(lastHp[r.id] - r.hp));
+      if (lastHp[r.id] != null && r.hp < lastHp[r.id] && r.alive && o && !o.dead && !o.dyingAt) {
+        o.flash = 0.09;
         for (let i = 0; i < 8; i++)
           spawnParticle(r.x - AW / 2, o.r, r.y - AH / 2, (Math.random() - 0.5) * 120, Math.random() * 90, (Math.random() - 0.5) * 120, 0.3, 1, 0.95, 0.6, 0.85, 150);
-      } else if (lastHp[r.id] != null && r.hp > lastHp[r.id] + 2 && r.alive && o) {
+        const now = performance.now(), amt = (dmgPending[r.id] || 0) + Math.round(lastHp[r.id] - r.hp);
+        if (!lastDmgAt[r.id] || now - lastDmgAt[r.id] > DMG_COALESCE_MS) {
+          damageNumber(r.x - AW / 2, r.y - AH / 2, o.r * 2.6, amt);
+          lastDmgAt[r.id] = now; dmgPending[r.id] = 0;
+        } else dmgPending[r.id] = amt;
+      } else if (lastHp[r.id] != null && r.hp > lastHp[r.id] + 2 && r.alive && o && !o.dead && !o.dyingAt) {
         damageNumber(r.x - AW / 2, r.y - AH / 2, o.r * 2.6, Math.round(r.hp - lastHp[r.id]), true);
       }
       lastHp[r.id] = r.hp;
       if (alivePrev[r.id] && !r.alive) {
-        playClip(["elim_" + slug(r.name), "eliminated"], `${r.name} is out!`);
-        killFeed(r.name); ticker(`☠ ${r.name} eliminated`);
-        cam.focus = { x: r.x - AW / 2, z: r.y - AH / 2, life: 0.7, max: 0.7 };
+        playClip(["elim_" + slug(r.name), "eliminated"], `${botLabel(r)} is out!`);
+        const colS = o ? "#" + o.col.toString(16).padStart(6, "0") : null;
+        elims.push({ name: botLabel(r), col: colS });
+        cam.focus = { x: r.x - AW / 2, z: r.y - AH / 2, life: 1.6, max: 1.6, zoom: 0.55 };
       }
       alivePrev[r.id] = r.alive;
     });
-    // slow-mo + letterbox on the deciding blow
+    // fallback: deciding blow on the very last frame (nothing left to peek at)
     const aliveN = fr.status ? fr.status.alive : fr.robots.filter((r) => r.alive).length;
     if (aliveN <= 1 && !slowmoFired && tk > 2) {
-      slowmoFired = true; slowmoT = 2.4; setLetterbox(true); ticker("⚡ THE FINAL BLOW");
+      slowmoFired = true; slowmoT = 2.0; setLetterbox(true); ticker("⚡ THE FINAL BLOW");
       playClip("final_blow", "Finish him!", { flush: true });
     }
+  }
+  if (elims.length) {
+    killFeed(elims);
+    // one victim keeps its own tint and name; a multi-kill names them on the
+    // bar and counts them on the stinger, which has room for one line only
+    stinger(elims.length === 1
+      ? elims[0].name.toUpperCase() + " ELIMINATED"
+      : elims.length + " ELIMINATED", elims.length === 1 ? elims[0].col : null);
   }
   lastTickSeen = tick;
 }
 
-// scrolling kill feed (DOM)
-const feedEl = document.getElementById("killfeed");
-function killFeed(name) {
-  if (!feedEl) return;
-  const d = document.createElement("div");
-  d.className = "kf"; d.textContent = "☠  " + name + " ELIMINATED";
-  feedEl.appendChild(d);
-  setTimeout(() => { d.classList.add("fade"); }, 50);
-  setTimeout(() => { d.remove(); }, 4200);
-  while (feedEl.children.length > 5) feedEl.removeChild(feedEl.firstChild);
+// kill events reuse the lower-third event bar (see ticker below): red-edged
+// variant, victim names in team color — the biggest text on screen for 4s
+function killFeed(victims) {
+  showBar((d) => {
+    d.className = "tk kill";
+    victims.forEach((v, i) => {
+      if (i) d.append(", ");
+      const b = document.createElement("b");
+      b.textContent = v.name; if (v.col) b.style.color = v.col;
+      d.append(b);
+    });
+    d.append(" ELIMINATED");
+  });
 }
 
 // ----- team grouping --------------------------------------------------------
-// A robot carries r.team (a label). When some team has >1 member we're in a team
-// match and the scoreboard groups + colours by side; otherwise it's a free-for-all
-// and rows stay flat (unchanged). teamOf() falls back to the robot id for soloists.
+// A robot carries r.team (a label). Explicit labels identify team/bracket matches;
+// "solo:<id>" identifies free-for-all entrants. teamOf() preserves that fallback.
 const teamOf = (r) => (r.team != null ? r.team : "solo:" + r.id);
 function teamInfo(robots) {
   const order = [], by = {};
   robots.forEach((r) => { const t = teamOf(r); if (!(t in by)) { by[t] = []; order.push(t); } by[t].push(r); });
-  return { order, by, hasTeams: order.length < robots.length };
+  // A label on every robot with more than two sides is a free-for-all wearing
+  // team labels (the event's 41-entrant field, and samples/ffa.jsonl): grouping
+  // it draws a team header over every single machine and doubles the rail.
+  // Two sides is the bracket format — a team match even at one machine each.
+  const labelled = robots.some((r) => !String(teamOf(r)).startsWith("solo:"));
+  return { order, by, hasTeams: labelled && (order.length <= 2 || order.length < robots.length) };
 }
 let teamMode = false, teamNames = [];
 // Short per-bot label: drop the "Team:" prefix the bracket prepends, since the
 // team header already names the side.
 const botLabel = (r) => { const i = String(r.name).indexOf(":"); return i >= 0 ? r.name.slice(i + 1) : r.name; };
 
-// live scoreboard (DOM; rows created once, updated each frame, CSS-order reflows)
+// live scoreboard (DOM; rows created once, updated each frame, CSS-order reflows).
+// 1v1 team matches (the bracket format) get a top-center esports scorebug
+// instead; the stacked rail survives only for >2 sides (FFA).
 const sbEl = document.getElementById("scoreboard");
-let sbRows = {}, sbTeamHdr = {};
+let sbRows = {}, sbTeamHdr = {}, sbgEls = null;
+// 12x12 inline SVG glyphs (self-contained) replace the rocket/trap emoji
+const ICO_RKT = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M6 .5c1.7 1.1 2.5 2.9 2.5 4.9L6 11.5 3.5 5.4C3.5 3.4 4.3 1.6 6 .5z"/></svg>';
+const ICO_TRP = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M6 1l5 5-5 5-5-5z"/></svg>';
 function buildScoreboard(robots) {
   if (!sbEl) return;
   robots = robots.filter((r) => r.team !== "house");   // the Gatekeeper isn't a contestant
-  sbEl.innerHTML = ""; sbRows = {}; sbTeamHdr = {};
+  sbEl.innerHTML = ""; sbRows = {}; sbTeamHdr = {}; sbgEls = null;
+  const oldBug = document.getElementById("scorebug"); if (oldBug) oldBug.remove();
+  if (timerEl) timerEl.style.display = "";
   const ti = teamInfo(robots);
   teamMode = ti.hasTeams; teamNames = ti.order;
   sbEl.classList.toggle("teams", teamMode);
+  if (teamMode && teamNames.length === 2) {
+    // esports scorebug: [plate A][clock][plate B], top-center; absorbs #timer
+    const bug = document.createElement("div"); bug.id = "scorebug";
+    sbgEls = teamNames.map((t, i) => {
+      const col = "#" + colorFor(ti.by[t][0]).toString(16).padStart(6, "0");
+      const d = document.createElement("div");
+      d.className = "sbg-plate" + (i ? " right" : "");
+      d.style.setProperty("--team-col", col);
+      d.innerHTML = '<span class="sbg-name"></span><span class="sbg-hp"><i class="ghost"></i><i class="fill"></i></span>';
+      d.querySelector(".sbg-name").textContent = t;
+      return { team: t, el: d, hp: d.querySelector(".sbg-hp"),
+               ghost: d.querySelector(".ghost"), fill: d.querySelector(".fill") };
+    });
+    const mid = document.createElement("div"); mid.id = "sbg-mid";
+    mid.innerHTML = '<div id="sbg-clock">00:00</div><div class="sbg-round"></div>';
+    const mt = document.getElementById("mtitle");
+    mid.querySelector(".sbg-round").textContent = (mt && mt.textContent) ? mt.textContent : "ROBOT WARS";
+    bug.append(sbgEls[0].el, mid, sbgEls[1].el);
+    stage.appendChild(bug);
+    if (timerEl) timerEl.style.display = "none";
+    return;
+  }
   const mkRow = (r, useShortName) => {
     const col = "#" + colorFor(r).toString(16).padStart(6, "0");
     const row = document.createElement("div"); row.className = "sb-row";
@@ -1942,7 +3033,8 @@ function buildScoreboard(robots) {
       `<span class="sb-ammo"></span><span class="sb-dmg" title="damage dealt"></span>`;
     sbEl.appendChild(row);
     const e = { row, name: row.querySelector(".sb-name"), fill: row.querySelector(".sb-bar i"),
-      ammo: row.querySelector(".sb-ammo"), dmg: row.querySelector(".sb-dmg") };
+      ammo: row.querySelector(".sb-ammo"), dmg: row.querySelector(".sb-dmg"), ammoLast: "" };
+    e.fill.style.background = col;         // team color carries the bar, always
     e.name.textContent = useShortName ? botLabel(r) : r.name;
     sbRows[r.id] = e;
   };
@@ -1952,8 +3044,11 @@ function buildScoreboard(robots) {
       const col = "#" + colorFor(members[0]).toString(16).padStart(6, "0");
       const hdr = document.createElement("div"); hdr.className = "sb-team";
       hdr.style.setProperty("--tc", col);
+      // The team name arrives from the recording, so it is participant-controlled:
+      // it goes in as text, never as markup. (`col` is a number from colorFor.)
       hdr.innerHTML = `<span class="sb-tdot" style="background:${col}"></span>` +
-        `<span class="sb-tname">${t}</span><span class="sb-tcount"></span>`;
+        `<span class="sb-tname"></span><span class="sb-tcount"></span>`;
+      hdr.querySelector(".sb-tname").textContent = t;
       sbEl.appendChild(hdr);
       sbTeamHdr[t] = { el: hdr, count: hdr.querySelector(".sb-tcount"), total: members.length };
       members.forEach((r) => mkRow(r, true));
@@ -1961,9 +3056,30 @@ function buildScoreboard(robots) {
   } else {
     robots.forEach((r) => mkRow(r, false));
   }
+  // Past ~18 entries the full-fat row cannot fit the stage even in two columns,
+  // so shed per-row detail rather than push names off the bottom edge.
+  sbEl.classList.toggle("dense", sbEl.children.length > 18);
 }
 function updateScoreboard(robots) {
   if (!sbEl) return;
+  if (sbgEls) {
+    // scorebug: per-side aggregate HP; low HP pulses the bar (no traffic lights)
+    const agg = {};
+    robots.forEach((r) => {
+      if (r.team === "house") return;
+      const t = teamOf(r); const a = agg[t] || (agg[t] = [0, 0]);
+      a[0] += Math.max(0, r.hp); a[1] += r.max_hp;
+    });
+    sbgEls.forEach((pl) => {
+      const a = agg[pl.team] || [0, 1];
+      const frac = Math.max(0, Math.min(1, a[0] / Math.max(1, a[1])));
+      const w = (frac * 100) + "%";
+      pl.fill.style.width = w;
+      pl.ghost.style.width = w;              // white damage-lag ghost (CSS delay)
+      pl.hp.classList.toggle("low", frac > 0 && frac < 0.25);
+    });
+    return;
+  }
   if (!teamMode) {
     const order = robots.slice().sort((a, b) => (b.alive - a.alive) || (b.hp - a.hp));
     order.forEach((r, i) => { const e = sbRows[r.id]; if (e) e.row.style.order = i; });
@@ -1972,8 +3088,9 @@ function updateScoreboard(robots) {
     const e = sbRows[r.id]; if (!e) return;
     const frac = Math.max(0, r.hp / r.max_hp);
     e.fill.style.width = (frac * 100) + "%";
-    e.fill.style.background = frac > 0.5 ? "#6bcb77" : frac > 0.25 ? "#ffd93d" : "#ff6b6b";
-    e.ammo.textContent = `🚀${r.rkt} ◆${r.trp}`;
+    e.fill.classList.toggle("low", frac > 0 && frac < 0.25);
+    const ammoKey = r.rkt + "|" + r.trp;
+    if (e.ammoLast !== ammoKey) { e.ammoLast = ammoKey; e.ammo.innerHTML = `${ICO_RKT}${r.rkt} ${ICO_TRP}${r.trp}`; }
     if (e.dmg) e.dmg.textContent = (r.dmg || 0) + "";
     e.row.classList.toggle("dead", !r.alive);
   });
@@ -1987,21 +3104,39 @@ function updateScoreboard(robots) {
   }
 }
 
-// ---- broadcast overlay: ticker, stinger, title card, round timer ----------
+// ---- broadcast overlay: lower-third event bar, stinger, title card, timer --
+// One broadcast surface: a single bar at a time, REPLACING (not stacking) the
+// previous message.
 const tickerEl = document.getElementById("ticker");
-function ticker(msg) {
+let barTimers = [];
+function showBar(build) {
   if (!tickerEl) return;
-  const d = document.createElement("span"); d.className = "tk"; d.textContent = msg;
+  barTimers.forEach(clearTimeout); barTimers = [];
+  tickerEl.innerHTML = "";
+  const d = document.createElement("span");
+  build(d);
   tickerEl.appendChild(d);
-  setTimeout(() => d.classList.add("show"), 30);
-  setTimeout(() => d.classList.remove("show"), 5000);
-  setTimeout(() => d.remove(), 5500);
-  while (tickerEl.children.length > 4) tickerEl.removeChild(tickerEl.firstChild);
+  barTimers = [
+    setTimeout(() => d.classList.add("show"), 30),
+    setTimeout(() => d.classList.remove("show"), 4200),
+    setTimeout(() => d.remove(), 4700),
+  ];
+}
+function ticker(msg) {
+  showBar((d) => { d.className = "tk"; d.textContent = msg; });
 }
 const stingerEl = document.getElementById("stinger");
-function stinger(text) {
+function stinger(text, col) {
   if (!stingerEl) return;
   stingerEl.textContent = text; stingerEl.classList.remove("go");
+  stingerEl.style.fontSize = "";
+  const range = document.createRange(); range.selectNodeContents(stingerEl);
+  const textWidth = range.getBoundingClientRect().width, maxWidth = window.innerWidth * 0.4;
+  if (textWidth > maxWidth)
+    stingerEl.style.fontSize = `${parseFloat(getComputedStyle(stingerEl).fontSize) * maxWidth / textWidth}px`;
+  // per-call tint (eliminations): longhand backgroundImage keeps background-clip:text
+  stingerEl.style.backgroundImage = col
+    ? `linear-gradient(180deg,#fff 10%,${col} 60%,${col} 100%)` : "";
   void stingerEl.offsetWidth; stingerEl.classList.add("go");
 }
 const titleEl = document.getElementById("titlecard");
@@ -2060,9 +3195,11 @@ function showTitleCard(n) {
 }
 const timerEl = document.getElementById("timer");
 function updateTimer(timeLeft) {
-  if (!timerEl) return;
   const s = Math.max(0, Math.round(timeLeft / 10));   // ticks -> ~seconds for a broadcast clock
-  timerEl.textContent = `⏱ ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const txt = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const sc = document.getElementById("sbg-clock");    // scorebug clock absorbs #timer
+  if (sc) { sc.textContent = txt; return; }
+  if (timerEl) timerEl.textContent = txt;
 }
 
 function updateFX(dt) {
@@ -2088,6 +3225,19 @@ function updateFX(dt) {
     if (b.life > 0) { b.life -= dt; b.mesh.material.opacity = Math.max(0, b.life / b.max); }
     else b.mesh.material.opacity = 0;
   });
+  // cannon slugs in flight: burst lands on arrival
+  for (let i = slugs.length - 1; i >= 0; i--) {
+    const s = slugs[i]; s.t += dt;
+    const q = Math.min(1, s.t / s.dur);
+    s.sp.position.lerpVectors(s.from, s.to, q);
+    if (q < 1) continue;
+    for (let k = 0; k < 22; k++)
+      spawnParticle(s.to.x, s.to.y, s.to.z, (Math.random() - 0.5) * 260, Math.random() * 200, (Math.random() - 0.5) * 260,
+        0.35, 1, 0.8, 0.4, 0.85, 260, 50);
+    flash(s.to.x, 40, s.to.z, 0xffcc88, 2.5);
+    shake(6);
+    scene.remove(s.sp); s.sp.material.dispose(); slugs.splice(i, 1);
+  }
   // debris chunks (arc + tumble + fade)
   for (let i = debris.length - 1; i >= 0; i--) {
     const d = debris[i]; d.life -= dt;
@@ -2098,14 +3248,16 @@ function updateFX(dt) {
     d.mesh.rotation.x += d.rx * dt; d.mesh.rotation.z += d.rz * dt;
     d.mesh.material.opacity = Math.min(1, d.life / 0.4); d.mesh.material.transparent = d.life < 0.4;
   }
-  // scorch decals (slow fade)
+  // scorch decals: persistent for the match; only cap-evicted ones fade
   for (let i = scorches.length - 1; i >= 0; i--) {
-    const s = scorches[i]; s.life -= dt;
+    const s = scorches[i];
+    if (s.life === Infinity) continue;
+    s.life -= dt;
     if (s.life <= 0) { scene.remove(s.mesh); s.mesh.geometry.dispose(); s.mesh.material.dispose(); scorches.splice(i, 1); continue; }
     s.mesh.material.opacity = 0.55 * Math.min(1, s.life / 1.5);
   }
-  // robot hit-flash decay
-  for (const id in robotObjs) { const o = robotObjs[id]; if (o.flash > 0) o.flash = Math.max(0, o.flash - dt * 3.5); }
+  // robot hit-flash decay (~90ms white pop)
+  for (const id in robotObjs) { const o = robotObjs[id]; if (o.flash > 0) o.flash = Math.max(0, o.flash - dt); }
   // atmosphere
   updateEmbers(dt);
   updateCamFlashes(dt);
@@ -2144,21 +3296,65 @@ const COMP_FRAG = `varying vec2 vUv; uniform sampler2D tScene, tBloom; uniform f
   void main(){ vec3 s=texture2D(tScene,vUv).rgb; vec3 b=texture2D(tBloom,vUv).rgb;
     gl_FragColor=vec4(s + b*uStrength, 1.0); }`;
 const bloom = (function () {
-  let ok = false, sceneRT, brightRT, blurA, blurB, postScene, postCam, quad, matBright, matBlur, matComp;
+  // The scene target stays multisampled for the broadcast. The jumbotron gets
+  // a separate non-MSAA scene pass with its own screen + cyan frame hidden,
+  // preventing the live mirror from recursively capturing its own housing.
+  let ok = false, sceneRT, feedRT, brightRT, blurA, blurB, postScene, postCam, quad, matBright, matBlur, matComp;
   const HALF = 2;
   const dim = new T.Vector2();
   const size = () => { renderer.getDrawingBufferSize(dim); return dim; };
-  function makeRT(w, h, srgb) {
+  // Dynamic resolution. The scene passes render into targets scaled by this and
+  // the composite blits them back up to the full canvas, so the HUD, scorebug
+  // and roster rail stay pixel-sharp while only the expensive 3D work gets
+  // cheaper. The controller that moves it lives with the main loop below.
+  let resScale = 1;
+  const rtDim = new T.Vector2();
+  const rtSize = () => {
+    const d = size();
+    return rtDim.set(Math.max(1, Math.round(d.x * resScale)), Math.max(1, Math.round(d.y * resScale)));
+  };
+  // This chain drops to `ok = false` (direct render, static jumbotron) from
+  // three places below with nothing shown on screen; an operator running the
+  // show must not learn about a degraded broadcast from a diff in picture
+  // quality. Fires once per session, not once per frame.
+  let warned = false;
+  function warnDegraded(e) {
+    console.error("post-processing failed -> degraded render", e);
+    if (warned) return;
+    warned = true;
+    const banner = document.createElement("div");
+    banner.textContent = "DEGRADED RENDER MODE -- post-processing disabled, see console";
+    banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#a11;color:#fff;" +
+      "font:600 13px/1.6 sans-serif;text-align:center;padding:4px 0;pointer-events:none;";
+    document.body.appendChild(banner);
+  }
+  // Supersampling was removed: what looked like crawling silhouette aliasing
+  // was actually the depth-precision bug fixed by the camera near plane above,
+  // not a sample-count problem, and rendering ~2.5x the pixels doubled GPU
+  // cost for no benefit.
+  function makeRT(w, h, srgb, samples) {
     const rt = new T.WebGLRenderTarget(Math.max(1, w), Math.max(1, h),
       { minFilter: T.LinearFilter, magFilter: T.LinearFilter, type: T.UnsignedByteType });
     rt.texture.colorSpace = srgb ? T.SRGBColorSpace : T.NoColorSpace;
     rt.texture.generateMipmaps = false;
+    // MSAA on WebGL2 (the canvas `antialias` flag never applies inside a target).
+    // Only sceneRT (below) passes `samples`. 4x is the quality/cost knee there;
+    // 8x was chasing a stair-stepping artifact that turned out to be the
+    // depth-precision bug fixed by the camera near plane above, not sample
+    // count, so it wasn't worth the doubled GPU cost.
+    if (samples) rt.samples = Math.min(samples, renderer.capabilities.maxSamples || samples);
     return rt;
   }
+  function doResize() {
+    const d = rtSize(), bw = Math.max(1, Math.floor(d.x / HALF)), bh = Math.max(1, Math.floor(d.y / HALF));
+    sceneRT.setSize(d.x, d.y); feedRT.setSize(d.x, d.y);
+    brightRT.setSize(bw, bh); blurA.setSize(bw, bh); blurB.setSize(bw, bh);
+  }
   try {
-    const d = size();
+    const d = rtSize();
     const bw = Math.max(1, Math.floor(d.x / HALF)), bh = Math.max(1, Math.floor(d.y / HALF));
-    sceneRT = makeRT(d.x, d.y, true);            // full-res scene (sRGB-encoded, matches screen)
+    sceneRT = makeRT(d.x, d.y, true, 4);     // native-res scene (sRGB, matches screen)
+    feedRT = makeRT(d.x, d.y, true);         // resolved broadcast for the jumbotron
     brightRT = makeRT(bw, bh, false); blurA = makeRT(bw, bh, false); blurB = makeRT(bw, bh, false);
     postScene = new T.Scene(); postCam = new T.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     quad = new T.Mesh(new T.PlaneGeometry(2, 2)); postScene.add(quad);
@@ -2167,21 +3363,50 @@ const bloom = (function () {
     matBlur = new T.ShaderMaterial({ vertexShader: POST_VERT, fragmentShader: BLUR_FRAG,
       depthTest: false, depthWrite: false, uniforms: { tDiffuse: { value: null }, uDir: { value: new T.Vector2() }, uTexel: { value: new T.Vector2() } } });
     matComp = new T.ShaderMaterial({ vertexShader: POST_VERT, fragmentShader: COMP_FRAG,
-      depthTest: false, depthWrite: false, uniforms: { tScene: { value: null }, tBloom: { value: null }, uStrength: { value: 0.7 } } });
+      depthTest: false, depthWrite: false, uniforms: { tScene: { value: null }, tBloom: { value: null }, uStrength: { value: 0.45 } } });
     ok = true;
-  } catch (e) { console.warn("bloom init failed -> direct render", e); ok = false; }
+  } catch (e) { warnDegraded(e); ok = false; }
   return {
     get ok() { return ok; },
+    // QA handle: flipping this off drops to the direct canvas render, which is
+    // the only way to A/B whether the post chain is costing us anti-aliasing.
+    set ok(v) { ok = v; },
+    get sizes() { return ok ? { scene: [sceneRT.width, sceneRT.height], samples: sceneRT.samples, scale: resScale } : null; },
+    get scale() { return resScale; },
+    setScale(s) {
+      const v = Math.max(0.5, Math.min(1, s));
+      if (!ok || Math.abs(v - resScale) < 1e-6) return;
+      resScale = v;
+      try { doResize(); } catch (e) { warnDegraded(e); ok = false; }
+    },
+    get feedTexture() { return ok && feedRT ? feedRT.texture : null; },
     resize() {
       if (!ok) return;
-      try {
-        const d = size(), bw = Math.max(1, Math.floor(d.x / HALF)), bh = Math.max(1, Math.floor(d.y / HALF));
-        sceneRT.setSize(d.x, d.y); brightRT.setSize(bw, bh); blurA.setSize(bw, bh); blurB.setSize(bw, bh);
-      } catch (e) { ok = false; }
+      try { doResize(); } catch (e) { warnDegraded(e); ok = false; }
     },
     render() {
       if (!ok) { renderer.setRenderTarget(null); renderer.render(scene, camera); return; }
+      const feedScreen = jumboFeedScreen, feedFrame = jumboFeedFrame;
       try {
+        if (feedScreen) feedScreen.visible = false;
+        if (feedFrame) feedFrame.visible = false;
+        renderer.setRenderTarget(feedRT); renderer.render(scene, camera);
+        if (feedScreen && !feedScreen.userData.liveFeed) {
+          feedScreen.userData.liveFeed = true;
+          feedScreen.material = new T.ShaderMaterial({
+            uniforms: {
+              tFeed: { value: feedRT.texture },
+              uRepeat: { value: feedScreen.userData.feedRepeat },
+              uOffset: { value: feedScreen.userData.feedOffset },
+            },
+            vertexShader: "varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }",
+            fragmentShader: "varying vec2 vUv; uniform sampler2D tFeed; uniform vec2 uRepeat,uOffset; void main(){ gl_FragColor=texture2D(tFeed,vUv*uRepeat+uOffset); }",
+            side: T.DoubleSide,
+            toneMapped: false,
+          });
+        }
+        if (feedScreen) feedScreen.visible = true;
+        if (feedFrame) feedFrame.visible = true;
         renderer.setRenderTarget(sceneRT); renderer.render(scene, camera);
         matBright.uniforms.tDiffuse.value = sceneRT.texture; quad.material = matBright;
         renderer.setRenderTarget(brightRT); renderer.render(postScene, postCam);
@@ -2196,33 +3421,126 @@ const bloom = (function () {
         }
         quad.material = matComp; matComp.uniforms.tScene.value = sceneRT.texture; matComp.uniforms.tBloom.value = blurB.texture;
         renderer.setRenderTarget(null); renderer.render(postScene, postCam);
-      } catch (e) { console.warn("bloom render failed -> direct render", e); ok = false; renderer.setRenderTarget(null); renderer.render(scene, camera); }
+      } catch (e) {
+        if (feedScreen) feedScreen.visible = true;
+        if (feedFrame) feedFrame.visible = true;
+        warnDegraded(e); ok = false;
+        renderer.setRenderTarget(null); renderer.render(scene, camera);
+      }
     },
   };
 })();
 
+// ----- dynamic resolution ---------------------------------------------------
+// Every quality number above was tuned against the frame rate of ONE developer
+// laptop. The machine driving the venue is unknown, and the failure it would
+// produce — a slideshow in front of the whole company — is far worse than a
+// slightly soft picture. So watch the frame time and hand resolution back when
+// the GPU cannot hold the pace, then earn it again when it can.
+//
+// Deliberately asymmetric: drop after ~0.7s of slow frames, but require ~3s of
+// comfortable ones before climbing, so the picture settles instead of pumping
+// up and down. Levels are integers to keep the scale off floating-point drift.
+//
+// Thresholds are RELATIVE to the display's own frame budget, never absolute
+// milliseconds. requestAnimationFrame is locked to the refresh rate, so a
+// healthy 60Hz projector reports ~16.7ms and a healthy 120Hz laptop ~8.3ms —
+// any fixed "fast" threshold that works on one is unreachable on the other, and
+// the level could then only ever ratchet downwards. The budget is learned as a
+// running minimum that relaxes upward very slowly.
+const drs = { on: true, level: 0, maxLevel: 4, slow: 0, fast: 0, cool: 0,
+              budget: 0, samples: 0, retry: 0, lastClimb: false };
+const drsScale = (lv) => 1 - lv * 0.1;          // level 0..4 -> 1.00 .. 0.60
+const DRS_WARMUP = 60;      // frames of budget-learning before acting on anything
+const DRS_SLOW = 1.6;       // × budget: consistently missing frames
+const DRS_FAST = 1.15;      // × budget: riding the refresh cap with room to spare
+// the ?diag corner readout, created at the bottom of this file; null without ?diag
+let diagEl = null;
+const diagText = () => "build " + (window.__RW_BUILD__ || "UNSTAMPED")
+  + "  ·  res " + Math.round(drsScale(drs.level) * 100) + "%";
+function updateResolution(dt, wallDt) {
+  if (!drs.on || !bloom.ok) return;
+  drs.cool = Math.max(0, drs.cool - dt);
+  const ms = wallDt * 1000;
+  // a genuine stall — tab hidden, a 10MB parse, the debugger — is not a slow
+  // GPU, and must not be allowed to drag the picture down on its way past
+  if (ms > 500) { drs.slow = 0; drs.fast = 0; return; }
+  // learn the refresh interval: adopt any faster frame at once, drift upward
+  // only glacially so one lucky frame cannot pin the budget too low forever
+  if (!drs.budget || ms < drs.budget) drs.budget = ms;
+  else drs.budget += (ms - drs.budget) * 0.0005;
+  if (drs.samples++ < DRS_WARMUP) return;
+  // Hold the counters at zero through the whole settle window. They used to
+  // keep accumulating during it, so a level inherited a head start from the
+  // frames that were still catching up right after the change and could step
+  // again the instant the cooldown lapsed — under a sustained marginal frame
+  // rate that slammed straight to the floor instead of finding the highest
+  // level the machine can actually hold. Every level now has to prove itself
+  // over a full fresh run.
+  if (drs.cool > 0) { drs.slow = 0; drs.fast = 0; return; }
+  if (ms > drs.budget * DRS_SLOW) { drs.slow++; drs.fast = 0; }
+  else if (ms < drs.budget * DRS_FAST) { drs.fast++; drs.slow = 0; }
+  else { drs.slow = 0; drs.fast = 0; }
+  let lv = drs.level;
+  // back off after a climb that did not stick, so a machine sitting right on
+  // the edge settles at the level it can hold instead of pumping every few
+  // seconds for the whole show
+  if (drs.slow >= 40 && lv < drs.maxLevel) {
+    if (drs.lastClimb) drs.retry = Math.min(4, drs.retry + 1);
+    lv++; drs.lastClimb = false;
+  } else if (drs.fast >= 180 * (1 + drs.retry) && lv > 0) {
+    lv--; drs.lastClimb = true;
+  }
+  if (lv === drs.level) return;
+  drs.level = lv; drs.slow = 0; drs.fast = 0; drs.cool = 1.5;
+  bloom.setScale(drsScale(lv));
+  console.info(`dynamic resolution -> ${Math.round(drsScale(lv) * 100)}%`);
+  if (diagEl) diagEl.textContent = diagText();
+}
+
 // ----- main loop ------------------------------------------------------------
 function loop(t) {
   raf = requestAnimationFrame(loop);
+  // render suspension: while the match view is hidden (tournament shell showing
+  // the bracket, so #stage has no layout box) skip the sim + the full-res MSAA
+  // + bloom pipeline entirely. Keep the rAF alive so the next match resumes
+  // cleanly; reset lastT so the resume frame doesn't inherit a huge wall delta.
+  if (stage.offsetParent === null || stage.clientHeight === 0) { lastT = 0; return; }
   const now = t || 0;
+  // TWO deltas: the unclamped wall clock drives the playhead (playback
+  // speed independent of render framerate — no slow-motion below 20fps, no
+  // freeze when rAF stalls; processTickEvents batch-replays skipped ticks).
+  // The 0.05-clamped dt below is cosmetic-only: particles, debris, shake and
+  // flash decay, camera lerp.
+  const wallDt = lastT ? (now - lastT) / 1000 : 0.016;
   let dt = lastT ? (now - lastT) / 1000 : 0.016; lastT = now;
   dt = Math.min(dt, 0.05);
+  updateResolution(dt, wallDt);
+
+  // loop-driven white-flash decay (never strands a veil over the frame)
+  if (flashEl) { flashT = Math.max(0, flashT - dt * 3); flashEl.style.opacity = flashT; }
 
   // slow-mo on the deciding blow
   if (slowmoT > 0) { slowmoT = Math.max(0, slowmoT - dt); if (slowmoT === 0) setLetterbox(false); }
   const speedMul = slowmoT > 0 ? 0.32 : 1;
 
   if (playing && frames.length) {
-    simTime += fps * dt * speedMul;
+    const playDt = Math.max(0, wallDt - fightHold);
+    fightHold = Math.max(0, fightHold - wallDt);       // FIGHT beat lands first
+    simTime += fps * playDt * speedMul;
+    if (simTime >= frames.length - 1) simTime = frames.length - 1;
+    // fully drain tick events (incl. the deciding blow) BEFORE declaring the
+    // winner — otherwise a big catch-up batch's damage numbers land after
+    // playing/atEnd already flipped, spawning "post-victory" hit feedback
+    processTickEvents(Math.floor(simTime));
     if (simTime >= frames.length - 1) {
-      simTime = frames.length - 1; playing = false; setPlayLabel(); showWinner();
+      playing = false; setPlayLabel(); showWinner();
       if (!endFired) { endFired = true; if (window.RW && typeof window.RW.onMatchEnd === "function") window.RW.onMatchEnd(); }
     }
-    processTickEvents(Math.floor(simTime));
   }
   let alivePts = [{ x: 0, z: 0 }];
   if (frames.length) alivePts = applyFrame(simTime);
-  if (entrance && frames.length) updateEntrance(dt);   // pre-fight walk-on
+  if (entrance && frames.length) updateEntrance(wallDt);   // pre-fight walk-on (wall clock)
   animateEnvironment(now);
   updateHazardFX(now * 0.001, dt);
   updateDmgFloats(dt);
@@ -2232,8 +3550,28 @@ function loop(t) {
     if (mx) mx.update(dt * speedMul);
   }
   updateFX(dt);
+  // victory hero shot: slow orbital drift + a pumped ring/emissive on the winner
+  if (celebrate) {
+    if (performance.now() < celebrate.until) {
+      cam.az += dt * 0.35;
+      const wo = robotObjs[celebrate.id];
+      if (wo) {
+        wo.ring.visible = true;
+        wo.ring.material.opacity = 0.9 + 0.3 * Math.sin(performance.now() * 0.008);
+        const bm = wo.mesh.userData.bodyMat;
+        if (bm) bm.emissiveIntensity = 1.1 + 0.35 * Math.sin(performance.now() * 0.01);
+      }
+    } else {
+      celebrate = null;
+    }
+  }
   updateCamera(dt, alivePts);
   bloom.render();
+  if (jumboFeedScreen && !bloom.ok) {
+    jumboFeedScreen.userData.liveFeed = false;
+    jumboFeedScreen.material = jumboFeedScreen.userData.staticMaterial;
+    jumboFeedScreen = null;
+  }
 }
 
 // ----- winner / voice -------------------------------------------------------
@@ -2250,12 +3588,41 @@ let voiceOn = false;
 // key; falls back to browser speech when a clip is absent. MUST match
 // tournament/voice/lines.py slug().
 function slug(name) { return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, ""); }
+
+// Serialised lane for lines that must not talk over each other (the walk-on
+// roll-call). Everything else still fires the instant its event lands.
+let clipQueue = [], clipPlaying = null;
+function pumpClips() {
+  if (clipPlaying || !clipQueue.length) return;
+  const done = () => { clipPlaying = null; pumpClips(); };
+  try {
+    const a = new Audio(clipQueue.shift());
+    a.volume = 1; clipPlaying = a;
+    a.addEventListener("ended", done); a.addEventListener("error", done);
+    a.play().catch(done);
+  } catch (e) { clipPlaying = null; }
+}
+function flushClips() {
+  clipQueue = [];
+  if (clipPlaying) { try { clipPlaying.pause(); } catch (e) { /* ignore */ } clipPlaying = null; }
+}
+
 function playClip(keys, fallbackText, opts) {
-  if (!voiceOn) return;
+  if (!voiceOn) return; opts = opts || {};
   const map = window.__VOICE_CLIPS__;
   if (map) {
     const k = (Array.isArray(keys) ? keys : [keys]).find((x) => map[x]);
-    if (k) { try { const a = new Audio(map[k]); a.volume = 1; a.play().catch(() => {}); return; } catch (e) { /* fall through */ } }
+    if (k) {
+      if (opts.queue) { clipQueue.push(map[k]); pumpClips(); return; }
+      if (opts.flush) flushClips();
+      try {
+        const a = new Audio(map[k]); a.volume = 1;
+        // a rejected/undecodable clip must still speak the fallback text, not
+        // go silent -- the old `.catch(() => {})` swallowed the failure here.
+        a.play().catch(() => { if (fallbackText) speak(fallbackText, opts); });
+        return;
+      } catch (e) { /* fall through */ }
+    }
   }
   if (fallbackText) speak(fallbackText, opts);
 }
@@ -2269,7 +3636,7 @@ function tiebreakChampion() {
   const ranked = cands.slice().sort((a, b) =>
     (death[b.id] - death[a.id]) || ((b.dmg || 0) - (a.dmg || 0)) || (a.id - b.id));
   const top = ranked[0];
-  return { name: top.name, basis: `survived to tick ${death[top.id]}, ${top.dmg || 0} damage dealt` };
+  return { name: top.name, basis: `survived to tick ${death[top.id]}, ${top.dmg || 0} damage dealt`, robot: top };
 }
 function winningTeam() {
   // Sum surviving HP (then damage) per team across the final frame; the strongest
@@ -2285,19 +3652,47 @@ function winningTeam() {
   const clean = agg[win][0] > 0 && teams.slice(1).every((t) => agg[t][0] === 0);
   return { team: win, clean };
 }
+// victory hero shot: punch the kill-cam focus onto the winner, let the main
+// loop drift the camera and pump their ring/emissive (see celebrate above),
+// and pop 4 staggered team-colored bursts — banner reveal is delayed
+// separately (showBanner) so the hero shot lands first
+function heroShot(champ) {
+  if (!champ) return;
+  const col = colorFor(champ);
+  cam.focus = { x: champ.x - AW / 2, z: champ.y - AH / 2, life: 4.0, max: 4.0, zoom: 0.5 };
+  celebrate = { id: champ.id, until: performance.now() + 4000 };
+  for (let i = 0; i < 4; i++)
+    setTimeout(() => explode(champ.x + (Math.random() - 0.5) * 90, champ.y + (Math.random() - 0.5) * 90,
+      45 + Math.random() * 20, col), i * 450);
+}
+function showBanner(who, sub, col) {
+  // lower-third victory card slides in AFTER the hero shot has had time to land
+  // (arena stays visible behind it — see #banner in the template). col tints the
+  // card accent + name to the winner's team.
+  bannerTimer = setTimeout(() => {
+    banner.querySelector(".who").textContent = who;
+    const subEl = banner.querySelector(".sub");
+    subEl.textContent = sub; subEl.style.display = sub ? "" : "none";
+    if (col != null) banner.style.setProperty("--wincol", "#" + ((col >>> 0) & 0xffffff).toString(16).padStart(6, "0"));
+    banner.classList.add("show");
+  }, 2500);
+}
 function showWinner() {
   const last = frames[frames.length - 1];
   const alive = last.robots.filter((r) => r.alive && r.team !== "house");
-  let who, sub = `${frames.length} ticks`, say, keys, champ;
+  let who, sub = DEBUG ? `${frames.length} ticks` : "", say, keys, champ;
   if (teamMode) {
     const w = winningTeam();
     who = "TEAM " + w.team;
-    sub = w.clean ? `${frames.length} ticks` : `${frames.length} ticks · on health`;
+    sub = w.clean
+      ? (DEBUG ? `${frames.length} ticks` : "")
+      : (DEBUG ? `${frames.length} ticks · on health` : "on health");
     say = `Team ${w.team} wins!`;
     keys = ["win_" + slug(w.team), "winner"];
-    banner.querySelector(".who").textContent = "🏆 " + who;
-    banner.querySelector(".sub").textContent = sub;
-    banner.classList.add("show");
+    const members = last.robots.filter((r) => teamOf(r) === w.team);
+    const champM = members.find((r) => r.alive) || members[0];
+    heroShot(champM);
+    showBanner(who, sub, colorFor(champM));
     ticker(`🏆 Team ${w.team} takes it`);
     if (!saidWinner) { saidWinner = true; playClip(keys, say, { flush: true, rate: 0.98 }); }
     return;
@@ -2310,13 +3705,13 @@ function showWinner() {
   } else if (alive.length === 0) {
     const tb = tiebreakChampion(); who = tb.name; sub = `mutual KO — tiebreak: ${tb.basis}`;
     say = `Double knockout! ${who} takes it on a tiebreak.`; keys = ["double_ko", "winner"];
+    champ = tb.robot;
   } else {
     champ = alive.slice().sort((a, b) => b.hp - a.hp)[0]; who = champ.name + " (on HP)";
     say = `Time! ${champ.name} wins on health.`; keys = ["win_" + slug(champ.name), "winner"];
   }
-  banner.querySelector(".who").textContent = "🏆 " + who;
-  banner.querySelector(".sub").textContent = sub;
-  banner.classList.add("show");
+  heroShot(champ);
+  showBanner(who, sub, colorFor(champ));
   ticker(`🏆 ${who} is the champion`);
   if (!saidWinner) { saidWinner = true; playClip(keys, say, { flush: true, rate: 0.98 }); }
 }
@@ -2337,7 +3732,10 @@ function clearMatch() {
   for (const k in rocketObjs) delete rocketObjs[k];
   for (const k in mineObjs) delete mineObjs[k];
   for (const k in pickupObjs) delete pickupObjs[k];
-  for (let i = 0; i < MAXP; i++) parts[i].life = 0;
+  SPARKS.items.forEach((p) => { p.life = 0; });
+  SMOKE.items.forEach((p) => { p.life = 0; });
+  slugs.forEach((s) => { scene.remove(s.sp); s.sp.material.dispose(); });
+  slugs.length = 0;
   [debris, scorches, shells, shockwaves].forEach((arr) => {
     arr.forEach((d) => { scene.remove(d.mesh); d.mesh.geometry.dispose(); d.mesh.material.dispose(); });
     arr.length = 0;
@@ -2346,13 +3744,40 @@ function clearMatch() {
   dmgFloats.length = 0;
 }
 function loadText(txt) {
-  const fr = txt.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+  // v2 recordings open with a metadata header line ({schema, seed, ...}); skip
+  // it (and any future non-frame line) rather than crashing. A malformed line
+  // (half-written file from a crash) truncates playback instead of tracebacking
+  // on the broadcast surface.
+  const fr = [];
+  let meta = null;
+  const lines = txt.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (!l) continue;
+    let o;
+    try { o = JSON.parse(l); } catch (e) {
+      console.warn(`recording truncated at tick ${fr.length} (bad line ${i + 1}) — playing what loaded`);
+      break;
+    }
+    if (o && typeof o === "object" && !o.robots) { if (o.schema) meta = o; continue; }
+    fr.push(o);
+  }
+  window.RW_META = meta;
   if (!fr.length) return;
   clearMatch();
   frames = fr;
+  // broadcast pacing: default playhead rate lands any match in a <=35s window
+  // (playhead rate only — tick data and the recording untouched)
+  fps = Math.min(80, Math.max(18, Math.round(frames.length / 35)));   // clamp into the slider's [10,80]
+  if (speed) speed.value = fps;
+  updateSpeedLabel();
   const s0 = frames[0].status || {}; AW = s0.w || 1280; AH = s0.h || 768;
-  names = {}; alivePrev = {};
-  frames[0].robots.forEach((r) => { names[r.id] = r.name; alivePrev[r.id] = true; });
+  names = {}; alivePrev = {}; voiceKey = {}; hpBand = {}; hazardSaid = {};
+  // names[] is the short display name; voiceKey[] slugs the FULL "Team:Bot"
+  // label, which is what the baked per-bot clips are keyed on (voice/lines.py).
+  frames[0].robots.forEach((r) => {
+    names[r.id] = botLabel(r); voiceKey[r.id] = slug(r.name); alivePrev[r.id] = true;
+  });
   buildArena(s0.walls || [], s0.hazards || []);
   applyWeather(s0.weather || "clear");
   buildScoreboard(frames[0].robots);
@@ -2368,44 +3793,75 @@ function loadText(txt) {
     setSpotTeams(cols);
   })();
   for (const k in lastHp) delete lastHp[k];
-  if (feedEl) feedEl.innerHTML = "";
+  for (const k in dmgPending) delete dmgPending[k];   // ids restart at 0 each match —
+  for (const k in lastDmgAt) delete lastDmgAt[k];     // a stale amount lands on the first hit
+  if (tickerEl) tickerEl.innerHTML = "";
   simTime = 0; lastTickSeen = -1; saidGo = false; saidWinner = false; introT = INTRO_MAX;
   slowmoT = 0; slowmoFired = false; endFired = false; setLetterbox(false);
+  celebrate = null; if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  flashT = 0; if (flashEl) flashEl.style.opacity = 0;
+  fightHold = 0;
   banner.classList.remove("show");
-  const nBots = frames[0].robots.filter((r) => r.team !== "house").length;
-  $("hint").textContent = (teamMode && teamNames.length === 2)
-    ? `${frames.length} ticks · ${teamNames[0]} vs ${teamNames[1]}`
-    : `${frames.length} ticks · ${nBots} bots`;
-  if (frames[0].robots.some((r) => r.team === "house"))
+  if (frames[0].robots.some((r) => r.team === "house")) {
     ticker("🚨 HOUSE ROBOT ON PATROL — Gatekeeper is live. Stay clear.");
+    playClip(["house_robot"], "House robot on patrol. Stay clear!");
+  }
   showTitleCard(frames[0].robots.filter((r) => r.team !== "house").length);
   startEntrance();   // robots drive in through the gates, then playback begins
 }
 
 // ----- controls -------------------------------------------------------------
-function setPlayLabel() { playBtn.textContent = playing ? "⏸ Pause" : "▶ Play"; }
-function play(on) { playing = on; setPlayLabel(); if (on) banner.classList.remove("show"); }
+function setPlayLabel() { playBtn.textContent = playing ? "PAUSE" : "PLAY"; }
+// honest AUTO-CAM/MANUAL button: reflects cam.auto plus a live drag-override
+function syncCamBtn() {
+  const b = $("autocam"); if (!b) return;
+  const held = cam.auto && cam.override;
+  b.textContent = cam.auto ? (held ? "MANUAL·HOLD" : "AUTO-CAM") : "MANUAL";
+  b.setAttribute("aria-pressed", cam.auto);
+}
+// playback-rate readout next to the speed slider (ticks advanced per second)
+function updateSpeedLabel() { const el = $("speedval"); if (el) el.textContent = fps + " fps"; }
+function play(on) {
+  playing = on; setPlayLabel(); if (on) banner.classList.remove("show");
+  // rw-playing arms the auto-hiding chrome ("playing" is the tournament shell's
+  // own view-switch class — don't collide with it)
+  document.body.classList.toggle("rw-playing", on);
+}
+// video-player chrome: any mouse move shows the UI, 2.5s idle hides it again
+let uiTimer = null;
+function pokeUI() {
+  document.body.classList.add("showui");
+  clearTimeout(uiTimer);
+  uiTimer = setTimeout(() => document.body.classList.remove("showui"), 2500);
+}
+window.addEventListener("mousemove", pokeUI);
+pokeUI();
 playBtn.onclick = () => { if (simTime >= frames.length - 1) restart(); else play(!playing); };
 function restart() {
   simTime = 0; lastTickSeen = -1; saidGo = false; saidWinner = false; introT = INTRO_MAX;
   slowmoT = 0; slowmoFired = false; endFired = false; setLetterbox(false);
+  celebrate = null; if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+  flashT = 0; if (flashEl) flashEl.style.opacity = 0;
+  fightHold = 0;
   sdAnnounced = false;                      // replay re-announces sudden death
+  hpBand = {}; hazardSaid = {};             // ...and the damage-state / hazard callouts
   frames.length && frames[0].robots.forEach((r) => alivePrev[r.id] = true);
   for (const k in lastHp) delete lastHp[k];
-  if (feedEl) feedEl.innerHTML = "";
+  for (const k in dmgPending) delete dmgPending[k];
+  for (const k in lastDmgAt) delete lastDmgAt[k];
+  if (tickerEl) tickerEl.innerHTML = "";
   banner.classList.remove("show");
-  Object.values(robotObjs).forEach((o) => { o.dead = false; o.mesh.rotation.z = 0; o.mesh.position.y = 0; o.flash = 0; });
+  Object.values(robotObjs).forEach((o) => { o.dead = false; o.dyingAt = null; o.deadAtSim = null; o.label.visible = true; o.mesh.rotation.z = 0; o.mesh.position.y = 0; o.flash = 0; });
   startEntrance();   // replay gets the walk-on too
 }
 $("restart").onclick = restart;
-speed.oninput = (e) => fps = +e.target.value;
+speed.oninput = (e) => { fps = +e.target.value; updateSpeedLabel(); };
 $("voice").onclick = (e) => {
   voiceOn = !voiceOn; const b = e.currentTarget;
-  b.textContent = voiceOn ? "🔊 Voice" : "🔇 Voice"; b.setAttribute("aria-pressed", voiceOn);
+  b.textContent = voiceOn ? "VOICE ON" : "VOICE"; b.setAttribute("aria-pressed", voiceOn);
   if (synth) { if (voiceOn) speak("Commentary on.", { flush: true }); else synth.cancel(); }
 };
-$("autocam").onclick = (e) => { cam.auto = !cam.auto; e.currentTarget.setAttribute("aria-pressed", cam.auto);
-  e.currentTarget.textContent = cam.auto ? "🎥 Auto-cam" : "🎥 Manual"; };
+$("autocam").onclick = () => { cam.auto = !cam.auto; cam.override = false; cam.manualTgt = null; syncCamBtn(); };
 
 $("file").onchange = (e) => { const f = e.target.files[0]; if (f) { const r = new FileReader(); r.onload = () => loadText(r.result); r.readAsText(f); } };
 ["dragover", "drop"].forEach((ev) => document.addEventListener(ev, (e) => e.preventDefault()));
@@ -2419,12 +3875,20 @@ window.addEventListener("pointermove", (e) => {
   if (!cam.dragging) return;
   cam.az -= (e.clientX - cam.px) * 0.005; cam.el += (e.clientY - cam.py) * 0.004;
   cam.el = Math.max(0.15, Math.min(1.45, cam.el)); cam.px = e.clientX; cam.py = e.clientY;
+  // dragging while auto = temporary manual override: freeze framing, flip the
+  // button to MANUAL·HOLD, and re-arm the ~2.6s idle timer back to auto
+  if (cam.auto && !cam.override) { cam.override = true; cam.manualTgt = null; syncCamBtn(); }
+  cam.overrideUntil = performance.now() + 2600;
 });
 cv.addEventListener("wheel", (e) => { e.preventDefault(); cam.distMul = Math.max(0.4, Math.min(3, cam.distMul * (1 + Math.sign(e.deltaY) * 0.1))); }, { passive: false });
 
 // ----- resize ---------------------------------------------------------------
 function resize() {
   const w = stage.clientWidth, h = stage.clientHeight;
+  // Re-read the display density every resize: dragging the window to a monitor
+  // with a different pixel density used to leave this pinned at whatever it was
+  // on page load, so the arena rendered at the wrong resolution for the screen.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
   bloom.resize();
 }
@@ -2437,58 +3901,117 @@ raf = requestAnimationFrame(loop);
 // it needs no file (the offline CSP blocks fetching audio). Starts on the first
 // user gesture (autoplay policy) and is muted with the 🎵 button.
 const music = (() => {
-  let ctx = null, master = null, timer = null, on = false, step = 0;   // default OFF — opt-in via the 🔇 button
-  const ROOTS = [110.0, 87.31, 130.81, 98.0];   // A2 F2 C3 G3 — a calm minor loop
+  // Default OFF. The synthesised bed below is a placeholder and Alex has judged
+  // it not good enough to open an all-hands with, so it does not play unless
+  // someone deliberately turns it on. Flip back to `true` once a real licensed
+  // track replaces it.
+  let ctx = null, master = null, timer = null, on = false, step = 0;
+  // Driving industrial bed: 140bpm, four-on-the-floor kick, a distorted offbeat
+  // bass, snare on 2 and 4, and a hat grid. The old version was a slow ambient
+  // pad, which read as a hotel lobby under a robot fight.
+  const BPM = 140, BEAT = 60 / BPM, BAR = BEAT * 4;
+  const ROOTS = [55.0, 55.0, 73.42, 65.41];    // A1 A1 D2 C2 — riff, not wallpaper
   const hz = (semis, base) => base * Math.pow(2, semis / 12);
-  function pluck(freq, t, dur, gain, type) {
-    const o = ctx.createOscillator(), g = ctx.createGain();
-    o.type = type || "triangle"; o.frequency.value = freq;
-    o.connect(g); g.connect(master);
-    g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(gain, t + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    o.start(t); o.stop(t + dur + 0.05);
+
+  let noiseBuf = null;
+  function noise() {
+    if (!noiseBuf) {
+      noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 0.5, ctx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const src = ctx.createBufferSource(); src.buffer = noiseBuf; return src;
   }
-  function pad(root, t, dur) {
-    [0, 7, 12].forEach((iv, i) => {          // root + fifth + octave
+  function kick(t) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(150, t);
+    o.frequency.exponentialRampToValueAtTime(42, t + 0.11);   // pitch drop = punch
+    g.gain.setValueAtTime(0.9, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+    o.connect(g); g.connect(master); o.start(t); o.stop(t + 0.34);
+  }
+  function snare(t) {
+    const n = noise(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+    f.type = "highpass"; f.frequency.value = 1400;
+    g.gain.setValueAtTime(0.34, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
+    n.connect(f); f.connect(g); g.connect(master); n.start(t); n.stop(t + 0.21);
+  }
+  function hat(t, gain) {
+    const n = noise(), g = ctx.createGain(), f = ctx.createBiquadFilter();
+    f.type = "highpass"; f.frequency.value = 7000;
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    n.connect(f); f.connect(g); g.connect(master); n.start(t); n.stop(t + 0.07);
+  }
+  function bass(freq, t, dur) {
+    const o = ctx.createOscillator(), o2 = ctx.createOscillator();
+    const g = ctx.createGain(), f = ctx.createBiquadFilter();
+    o.type = "sawtooth"; o.frequency.value = freq;
+    o2.type = "square"; o2.frequency.value = freq; o2.detune.value = -8;   // grit
+    f.type = "lowpass"; f.Q.value = 9;
+    f.frequency.setValueAtTime(1500, t);
+    f.frequency.exponentialRampToValueAtTime(240, t + dur);                // filter sweep
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.24, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(f); o2.connect(f); f.connect(g); g.connect(master);
+    o.start(t); o2.start(t); o.stop(t + dur + 0.03); o2.stop(t + dur + 0.03);
+  }
+  function stab(root, t, dur) {
+    [0, 7, 15].forEach((iv, i) => {         // minor-ish power stack
       const o = ctx.createOscillator(), g = ctx.createGain(), f = ctx.createBiquadFilter();
-      o.type = "sawtooth"; o.frequency.value = hz(iv, root); o.detune.value = (i - 1) * 6;
-      f.type = "lowpass"; f.frequency.value = 640;
+      o.type = "sawtooth"; o.frequency.value = hz(iv, root * 4); o.detune.value = (i - 1) * 11;
+      f.type = "lowpass"; f.frequency.value = 2600;
       o.connect(f); f.connect(g); g.connect(master);
       g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.05, t + 0.6);
-      g.gain.linearRampToValueAtTime(0.04, t + dur - 0.6);
-      g.gain.linearRampToValueAtTime(0.0001, t + dur);
-      o.start(t); o.stop(t + dur + 0.05);
+      g.gain.linearRampToValueAtTime(0.05, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.start(t); o.stop(t + dur + 0.03);
     });
   }
   function tick() {
     if (!ctx) return;
-    const t = ctx.currentTime + 0.05, bar = 2.0, root = ROOTS[step % ROOTS.length];
-    pad(root, t, bar);
-    pluck(root / 2, t, 0.5, 0.09);                       // downbeat pulse
-    pluck(root / 2, t + bar / 2, 0.4, 0.06);
-    pluck(hz(12, root), t + bar * 0.75, 0.3, 0.03, "square");  // off-beat sparkle
+    const t = ctx.currentTime + 0.05, root = ROOTS[step % ROOTS.length];
+    for (let b = 0; b < 4; b++) {
+      const tb = t + b * BEAT;
+      kick(tb);                                     // four on the floor
+      if (b % 2 === 1) snare(tb);                   // backbeat
+      hat(tb + BEAT / 2, 0.12);
+      hat(tb + BEAT / 4, 0.05);
+      bass(root, tb + BEAT / 2, BEAT * 0.42);       // offbeat drive
+    }
+    bass(root, t, BEAT * 0.5);
+    stab(root, t, BEAT * 0.9);
+    if (step % 4 === 3) stab(hz(3, root), t + BEAT * 3, BEAT * 0.8);   // turnaround
     step++;
-    timer = setTimeout(tick, bar * 1000);
+    timer = setTimeout(tick, BAR * 1000);
   }
   function ensure() {
     if (ctx) return;
     const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
-    ctx = new AC(); master = ctx.createGain(); master.gain.value = on ? 0.16 : 0; master.connect(ctx.destination);
+    ctx = new AC(); master = ctx.createGain();
+    master.gain.value = on ? 0.085 : 0;   // drums are hot — sit under the announcer
+    master.connect(ctx.destination);
     tick();
   }
   return {
     kick() { ensure(); if (ctx && ctx.state === "suspended") ctx.resume(); },
-    toggle() { on = !on; if (master) master.gain.linearRampToValueAtTime(on ? 0.16 : 0, ctx.currentTime + 0.2); return on; },
+    toggle() { on = !on; if (master) master.gain.linearRampToValueAtTime(on ? 0.085 : 0, ctx.currentTime + 0.2); return on; },
     get on() { return on; },
   };
 })();
 const musicBtn = document.getElementById("music");
+// the bed defaults on now, so the button has to say so from the start
+if (musicBtn) {
+  musicBtn.setAttribute("aria-pressed", music.on);
+  musicBtn.textContent = music.on ? "MUSIC ON" : "MUSIC";
+}
 if (musicBtn) musicBtn.onclick = () => {
   const state = music.toggle();
   musicBtn.setAttribute("aria-pressed", state);
-  musicBtn.textContent = state ? "🎵 Music" : "🔇 Music";
+  musicBtn.textContent = state ? "MUSIC ON" : "MUSIC";
 };
 // start the bed on the first user gesture anywhere (autoplay policy)
 ["pointerdown", "keydown"].forEach((ev) =>
@@ -2505,9 +4028,28 @@ window.RW = {
   isPlaying: () => playing,
   atEnd: () => frames.length > 0 && simTime >= frames.length - 1,
   onMatchEnd: null,                       // set by the tournament shell
-  debug: { scene, camera, renderer, robotObjs, get arenaGroup() { return arenaGroup; },
+  debug: { scene, camera, renderer, robotObjs, cam, bloom, drs,
+           crowdCount: () => crowdCount,
+           // QA handle: feed the dynamic-resolution controller synthetic frame
+           // times to watch it step, without needing a GPU slow enough to sag
+           stepRes: updateResolution,
+           get arenaGroup() { return arenaGroup; },
+           get celebrate() { return celebrate; },
            seek: (t) => { simTime = Math.max(0, Math.min(t, frames.length - 1)); } },
 };
+
+// ----- build stamp (opt-in) ------------------------------------------------
+// This page is ~10MB and browsers hold onto it. Open it with ?diag to show the
+// build timestamp on screen, so "is this actually the build I just made" is a
+// glance rather than an argument. Off by default: nothing extra on the big
+// screen during the show.
+if (/[?&]diag\b/.test(location.search)) {
+  diagEl = document.createElement("div");
+  diagEl.textContent = diagText();
+  diagEl.style.cssText = "position:fixed;left:8px;bottom:6px;z-index:9999;opacity:.65;" +
+    "font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8fb4d4;pointer-events:none";
+  document.body.appendChild(diagEl);
+}
 
 // ----- autoload embedded demo match (instant picture; file/drop overrides) --
 // payloads ship gzipped: inflate them, then parse models, then roll the match

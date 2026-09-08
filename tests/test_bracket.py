@@ -31,7 +31,7 @@ check([t["name"] for t in teams] == ["Red", "Blue"], "teams keep first-seen orde
 check(len(teams[0]["bots"]) == 2, "Red has both its bots")
 
 # --- bracket seeding: pad to power of two with byes -----------------------
-slots = _seed_bracket([{"name": n} for n in ("A", "B", "C")], seed=1)
+slots = _seed_bracket([{"name": n} for n in ("A", "B", "C")], 1)
 check(len(slots) == 4, f"3 teams pad to a 4-slot bracket (got {len(slots)})")
 check(sum(1 for s in slots if s is None) == 1, "exactly one bye added")
 check(_seed_bracket([{"name": n} for n in "ABC"], 1) ==

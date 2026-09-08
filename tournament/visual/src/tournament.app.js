@@ -8,6 +8,11 @@
   if (!T) { console.error("no __TOURNAMENT__ payload"); return; }
 
   const $ = (id) => document.getElementById(id);
+  // Team names come from the files entrants submit, and this shell builds its
+  // markup with innerHTML — escape every one of them (arena.app.js reaches for
+  // textContent on the same data for the same reason).
+  const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (ch) => ESC[ch]);
   const colorOf = {};
   T.teams.forEach((t) => { colorOf[t.name] = t.color; });
 
@@ -36,9 +41,13 @@
     el.className = "slot " + cls;
     const c = colorOf[name];
     const crest = name
-      ? `<span class="crest" style="background:${c};color:#06101d;box-shadow:0 0 11px ${c}aa">${name[0].toUpperCase()}</span>`
+      ? `<span class="crest" style="background:${c};color:#06101d;box-shadow:0 0 11px ${c}aa">${esc(name[0].toUpperCase())}</span>`
       : `<span class="crest">?</span>`;
-    el.innerHTML = crest + `<span class="nm">${name || "—"}</span><span class="sc"></span>`;
+    const nm = name && c
+      ? `<span class="nm" style="border-left:4px solid ${c};padding-left:8px">${esc(name)}</span>`
+      : `<span class="nm">${name ? esc(name) : "—"}</span>`;
+    el.innerHTML = crest + nm + `<span class="sc"></span>`;
+    if (cls === "win" && c) el.style.boxShadow = `inset 3px 0 0 ${c}`;
     return el;
   }
 
@@ -59,12 +68,24 @@
     svg.setAttribute("height", host.scrollHeight);
     const line = (sx, sy, tx, ty, on) => {
       const midX = (sx + tx) / 2;
-      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      p.setAttribute("d", `M ${sx} ${sy} H ${midX} V ${ty} H ${tx}`);
-      p.setAttribute("fill", "none");
-      p.setAttribute("stroke", on ? "#2ec4b6" : "#26334f");
-      p.setAttribute("stroke-width", on ? "2.5" : "1.5");
-      svg.appendChild(p);
+      const path = `M ${sx} ${sy} H ${midX} V ${ty} H ${tx}`;
+      const stroke = (color, width) => {
+        const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        p.setAttribute("d", path);
+        p.setAttribute("fill", "none");
+        p.setAttribute("stroke", color);
+        p.setAttribute("stroke-width", width);
+        svg.appendChild(p);
+        return p;
+      };
+      if (on) {
+        const glow = stroke("#3fd0c9", "6");   // blurred duplicate behind the lit path
+        glow.setAttribute("opacity", ".25");
+        glow.style.filter = "blur(3px)";
+        stroke("#3fd0c9", "3");
+      } else {
+        stroke("#34343A", "2");
+      }
     };
     for (let rr = 0; rr < tieEls.length - 1; rr++) {
       (tieEls[rr] || []).forEach((src, k) => {
@@ -118,7 +139,7 @@
         if (!revealed) {                                // future round: hide names
           tie.classList.add("pending");
           tie.appendChild(slotEl(null, "tbd")); tie.appendChild(slotEl(null, "tbd"));
-          const m = document.createElement("div"); m.className = "meta"; m.textContent = "TBD";
+          const m = document.createElement("div"); m.className = "meta"; m.textContent = "Awaiting winner";
           tie.appendChild(m);
           ties.appendChild(tie);
           return;
@@ -136,7 +157,11 @@
         } else if (isNext) {
           tie.classList.add("playable");
           tie.onclick = () => playGame(r, g);
-          m.textContent = "▶ CLICK TO PLAY";
+          m.textContent = "CLICK TO PLAY";
+          const pill = document.createElement("span");
+          pill.className = "upnext-pill";
+          pill.textContent = "UP NEXT";
+          tie.appendChild(pill);
         } else {
           m.textContent = "UPCOMING";
         }
@@ -155,7 +180,7 @@
     box.className = "champ-box tie" + (done ? "" : " tbd");
     if (done) box.dataset.filled = "1";
     box.innerHTML = `<div class="lbl">Champion</div><div class="cup">🏆</div>` +
-      `<div class="nm">${done ? T.champion : "TBD"}</div>`;
+      `<div class="nm">${done ? esc(T.champion) : "TBD"}</div>`;
     cties.appendChild(box); cc.appendChild(cties); wrap.appendChild(cc);
     tieEls[rounds.length] = [box];
 
@@ -164,8 +189,8 @@
     const ng = nextGame();
     const btn = $("playnext");
     btn.disabled = !ng;
-    btn.textContent = ng ? `▶ Play next: ${ng.game.team_a} vs ${ng.game.team_b}` : "🏆 Tournament complete";
-    $("subtag").textContent = `Harris All Hands · ${T.teams.length} teams · ${T.map} · seed ${T.seed}`;
+    btn.textContent = ng ? `PLAY NEXT: ${ng.game.team_a} vs ${ng.game.team_b}` : "TOURNAMENT COMPLETE";
+    $("subtag").textContent = `${T.teams.length} teams · ${T.map} · seed ${T.seed}`;
     requestAnimationFrame(drawConnectors);
   }
 
@@ -192,22 +217,22 @@
       el.innerHTML =
         `<span class="rank">${isChamp ? "🏆" : i + 1}</span>` +
         `<span class="dot" style="background:${colorOf[t.name]};color:${colorOf[t.name]}"></span>` +
-        `<span class="nm">${t.name}</span>` +
-        `<span class="rec">${t.w}–${t.l}${t.out ? "" : " · in"}</span>`;
+        `<span class="nm">${esc(t.name)}</span>` +
+        `<span class="rec">${t.w}-${t.l}</span>`;
       box.appendChild(el);
     });
 
-    // the always-on strip pinned above both views mirrors the same standings
+    // strip shown during matches only: single panel bar of RANK TEAM W-L segments
     const strip = $("lb-strip");
-    strip.innerHTML = `<span class="lbs-label">🏆 Leaderboard</span>`;
+    strip.innerHTML = `<span class="lbs-label">Leaderboard</span>`;
     rows.forEach((t, i) => {
       const isChamp = done && t.name === T.champion;
       const el = document.createElement("span");
-      el.className = "lbs-pill" + (t.out ? " out" : "") + (isChamp ? " champ" : "");
+      el.className = "lbs-seg" + (t.out ? " out" : "") + (i === 0 ? " lead" : "");
       el.innerHTML =
-        `<span class="dot" style="background:${colorOf[t.name]};color:${colorOf[t.name]}"></span>` +
-        `<span>${isChamp ? "🏆 " : (i + 1) + ". "}${t.name}</span>` +
-        `<span class="rec">${t.w}–${t.l}</span>`;
+        `<span class="lbs-rank">${isChamp ? "🏆" : i + 1}</span>` +
+        `<span class="lbs-nm">${esc(t.name)}</span>` +
+        `<span class="lbs-rec">${t.w}-${t.l}</span>`;
       strip.appendChild(el);
     });
   }

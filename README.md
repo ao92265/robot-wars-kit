@@ -48,33 +48,62 @@ The bigger maps bite back: lava, water, ice, pits, powerup crates, a floor flipp
 
 ## Run a tournament
 
+One machine runs the whole show and venue internet is never required. The full
+playbook, with the T-minus checklist and a failure drill for everything that can
+go wrong on stage, is **`ORGANISER-RUNBOOK.md`**. The short version:
+
 ```
-# 1. collect everyone's my_bot.py into submissions/ (or run the submit server):
-python3 -m tournament.submit_server        # prints a URL players submit to over the LAN
-# 2. validate and run the whole bracket, recording every match:
-python3 -m tournament.runner submissions --auto --seed 1
-# 3. big screen: open tournament/visual/tournament.html for the bracket,
-#    or drop any recordings/*.jsonl on tournament/visual/arena.html
+python3 -m tournament.doctor                                   # preflight: green board or fix it
+python3 -m tournament.event create  myevent --format ffa --seed 1
+python3 -m tournament.event register myevent "Team A" "Team B"  # tokens, shown once
+python3 -m tournament.event serve   myevent                     # teams submit, watch /status
+python3 -m tournament.event snapshot myevent                    # CLOSE submissions, immutable
+python3 -m tournament.event run     myevent                     # heats or bracket, records every match
+python3 -m tournament.event closeout myevent                    # archive + sha256 manifest
+open tournament/visual/arena.html                               # big screen: drag any recording in
 ```
 
-- Matches run headless in under a second each and every one records to `.jsonl`. Pre-run the whole tournament before your event; the recordings are the fallback if anything misbehaves live.
-- Deterministic engine: same seed + same bots = byte-identical replay. All chaos rolls on seeded per-robot RNG, so results are fair and appealable.
-- Every bot runs sandboxed in its own process. A crash or infinite loop idles that bot, never the show.
-- Scales by entry count: 8 or fewer is one royale; more gets seeded heats with the top 2 advancing to a final.
+`--format ffa` is heats plus a final, `bracket` is a 1v1 knockout.
+
+- **Nothing can be lost.** Every accepted submission is journaled append only with a
+  receipt. A wrong token gets a 409 and the previous file is untouched. `serve --open`
+  drops the token check for a single room LAN event and keeps the journal.
+- **The snapshot is the roster.** After `snapshot`, late submissions do not exist for
+  this event. Closeout verifies the hashes and blocks on a hand edit.
+- **The recording is the result.** Match seeds are derived from team identity and stored
+  in the results. Disputes are settled by replaying, never by re running.
+- **A crash is survivable.** `run --resume` reloads completed matches and runs the rest
+  with identical seeds. A bot that hangs or crashes has its last action substituted and
+  the match continues.
+- Matches run headless in well under a second each. Pre run the whole thing on the
+  morning: the recordings are your fallback if anything misbehaves live.
 - Balance tuning lives in `engine/config.py` (budget, stat curves, speeds, arena size).
 
 ## Run your own event
 
-The 90-minute format that worked for 80 people:
+The 90 minute shape that worked for 80 people. The one thing worth copying exactly is
+the middle: **everyone builds their own bot, then each table plays off to pick the one
+that represents them.** Nobody sits idle watching someone else type, and the selection
+pressure is real.
 
-1. **5 min** brief and rules, watch the demo match
-2. **5 min** teams pick a loadout and write a three-line strategy on paper, design before code
-3. **40 min** build `decide()` with Claude Code, test against dummies, iterate
-4. **3 min** lock-in, bots collected
-5. **15 min** knockout bracket live on the big screen
-6. **5 min** awards and the debrief line: the winning team out-thought, not out-specced
+| Clock | Minutes | What happens |
+|---|---|---|
+| 09:30 | 12 | Talk and demo match |
+| 09:42 | 5 | Brief and rules |
+| 09:47 | 5 | Kit checkpoint: everyone shows `--check` READY |
+| 09:52 | 30 | Build your own bot |
+| 10:22 | 10 | Table playoff, `arena.py --vs-file rival.py` |
+| 10:32 | 3 | Lock in: each table hands in its champion |
+| 10:35 | 15 | Knockout bracket on the big screen |
+| 10:50 | 5 | Awards |
+| 10:55 | 5 | Buffer |
 
-Mixed teams work best. Non-engineers own the loadout and strategy calls (the archetype picks are plain-English decisions); engineers drive the code. Everyone has a job.
+Non engineers are not passengers: the loadout and the archetype picks are plain English
+decisions with real trade offs, and the strategy is a paragraph before it is code.
+
+Send everyone the kit link the day before, not just one person per table. Run the kit
+checkpoint before the build starts rather than after, so a laptop with no working Python
+is found while there is still time to fix it.
 
 ## Layout
 
@@ -88,6 +117,7 @@ PROMPT.md            <- paste into Claude Code
 engine/              <- the game: sim, view, sandbox, render
 tournament/          <- bracket runner, submit server, 3D visualiser
 tests/               <- engine tests (python3 tests/test_engine.py)
+ORGANISER-RUNBOOK.md <- running the show: checklist, drills, escalation
 ```
 
 Terminal animation needs nothing extra (ASCII). `pygame` is optional and only used by organisers.

@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "event-*"]
+  pull_request:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Test suites (pure stdlib, no pip)
+        shell: bash
+        run: |
+          for t in tests/test_*.py; do
+            echo "== $t"
+            python "$t"
+          done
+
+      - name: Determinism golden gate (budget lifted — measures the engine, not the runner)
+        shell: bash
+        run: python tests/determinism_gate.py --out "gate-${{ matrix.os }}-py${{ matrix.python }}.txt"
+
+      - name: Golden corpus — the 16 real event-1 bots must ingest 16/0
+        shell: bash
+        run: |
+          python -m tournament.ingest tests/golden_corpus | tee ingest.out
+          python - <<'EOF'
+          import json
+          m = json.load(open("tests/golden_corpus/manifest.json"))
+          assert m["n_accepted"] == 16 and m["n_rejected"] == 0, \
+              f"golden corpus broke: {m['n_accepted']} accepted / {m['n_rejected']} rejected"
+          print("golden corpus OK: 16/0")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ matrix.os }}-py${{ matrix.python }}
+          path: gate-*.txt
+
+  cross-os-determinism:
+    name: cross-OS byte-identity (empirical)
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: gates
+      - name: Compare frame hashes across OSes per Python version
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import os, collections
+          hashes = collections.defaultdict(dict)
+          for root, _, files in os.walk("gates"):
+              for f in files:
+                  if f.startswith("gate-") and f.endswith(".txt"):
+                      # gate-<os>-py<ver>.txt
+                      stem = f[5:-4]
+                      osname, py = stem.rsplit("-py", 1)
+                      hashes[py][osname] = open(os.path.join(root, f)).read().strip()
+          bad = False
+          for py, per_os in sorted(hashes.items()):
+              uniq = set(per_os.values())
+              status = "IDENTICAL" if len(uniq) == 1 else "DIVERGED"
+              print(f"py{py}: {status}")
+              for osname, h in sorted(per_os.items()):
+                  print(f"  {osname}: {h}")
+              if len(uniq) != 1:
+                  bad = True
+          if bad:
+              raise SystemExit(
+                  "cross-OS divergence: scope the determinism promise to a pinned "
+                  "organiser environment (see PRD risk) — do NOT weaken this job silently.")
+          print("cross-OS byte-identity holds for every python version tested")
+          EOF
+
+  kit:
+    name: player kit build + Windows smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build kits from git archive HEAD
+        run: python make_kit.py --player
+      - name: Unzip + first-battle smoke (what a player runs first)
+        shell: bash
+        run: |
+          mkdir kit_smoke && cd kit_smoke
+          unzip -q ../dist/robot-wars-player-kit.zip
+          cd robot-wars
+          python arena.py --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: player-kit
+          path: dist/robot-wars-player-kit.zip

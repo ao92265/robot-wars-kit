@@ -68,7 +68,7 @@ Rebuild the showcase viewer:
 cd arena-viewer && npm install && node build.mjs && open dist/robot-arena.html
 ```
 
-Package the kits:
+Package the kits for SharePoint:
 
 ```bash
 python3 make_kit.py     # dist/robot-wars-player-kit.zip + -dev-kit.zip

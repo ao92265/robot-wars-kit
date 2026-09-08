@@ -98,18 +98,41 @@ def cmd_submit(my, team):
     with open(os.path.join(ROOT, "my_bot.py")) as f:
         src = f.read()
     # Distributed submission: POST to the organiser's submit server if configured.
+    # When a URL is set, failure is a hard error — never silently fall back to a
+    # local drop the organiser will never see.
     url = os.environ.get("ROBOT_WARS_SUBMIT_URL")
     if url:
+        import hashlib
+        import urllib.error
         import urllib.request
-        req = urllib.request.Request(
-            url.rstrip("/") + "/submit", data=src.encode(),
-            headers={"X-Team-Name": team, "Content-Type": "text/plain"})
+        headers = {"X-Team-Name": team, "Content-Type": "text/plain"}
+        token = os.environ.get("ROBOT_WARS_TOKEN")
+        if token:
+            headers["X-Team-Token"] = token
+        req = urllib.request.Request(url.rstrip("/") + "/submit",
+                                     data=src.encode(), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                print(f"Submitted '{team}' to {url} — {r.read().decode().strip()}   ({msg})")
-            return 0
+                body = r.read().decode().strip()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace").strip()
+            print(f"Submission REJECTED by {url} ({e.code}): {detail}")
+            print("NOT submitted. Fix the issue above and retry.")
+            return 1
         except Exception as e:
-            print(f"Could not reach submit server at {url}: {e}\nFalling back to local drop.")
+            print(f"Could not reach submit server at {url}: {e}")
+            print("NOT submitted. Check the URL/network and retry; ask the organiser if it persists.")
+            return 1
+        try:
+            receipt = json.loads(body)
+            local = hashlib.sha256(src.encode()).hexdigest()
+            mark = ("receipt verified" if receipt.get("sha256") == local
+                    else "RECEIPT MISMATCH — resubmit and tell the organiser")
+            print(f"Submitted '{team}' to {url} — version {receipt.get('version')}, "
+                  f"sha256 {receipt.get('sha256', '')[:12]}… ({mark})   ({msg})")
+        except ValueError:
+            print(f"Submitted '{team}' to {url} — {body}   ({msg})")
+        return 0
     # Local fallback (shared drive via ROBOT_WARS_DROP, or this machine).
     drop = os.environ.get("ROBOT_WARS_DROP", os.path.join(ROOT, "submissions"))
     os.makedirs(drop, exist_ok=True)
@@ -123,9 +146,31 @@ def cmd_submit(my, team):
     return 0
 
 
-def cmd_replay(path):
+def _read_frames(path):
+    """Read a recording .jsonl tolerantly: skip the v2 metadata header (any
+    line without 'robots'), stop at the first malformed line (half-written
+    file from a crash) instead of tracebacking."""
+    frames = []
     with open(path) as f:
-        frames = [json.loads(line) for line in f if line.strip()]
+        for i, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                print(f"(recording truncated at tick {len(frames)} — playing what loaded)")
+                break
+            if isinstance(o, dict) and "robots" not in o:
+                continue  # metadata header
+            frames.append(o)
+    return frames
+
+
+def cmd_replay(path):
+    frames = _read_frames(path)
+    if not frames:
+        print("no playable frames in that recording")
+        return 1
     aw = frames[0]["status"].get("w", 1280)
     ah = frames[0]["status"].get("h", 768)
     names = [r["name"] for r in frames[0]["robots"]]
